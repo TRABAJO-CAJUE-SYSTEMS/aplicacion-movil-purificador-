@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"D:\\\\PROYECTO DE APP NATIVE NO TOCAR\\\\app movil\\\\airpure-app\" -Recurse -Depth 3)",
+      "Bash(Select-Object FullName)",
+      "Bash(not exist *)",
+      "Bash(npx expo *)"
+    ]
+  }
+}

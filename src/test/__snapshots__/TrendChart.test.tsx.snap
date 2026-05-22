@@ -1,0 +1,32 @@
+// Jest Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`TrendChart renderiza correctamente con datos 1`] = `
+<View
+  style={
+    {
+      "alignItems": "center",
+      "marginVertical": 20,
+    }
+  }
+>
+  <Text
+    style={
+      {
+        "color": "#333",
+        "fontSize": 16,
+        "fontWeight": "bold",
+        "marginBottom": 10,
+      }
+    }
+  >
+    Tendencia de Sensores
+  </Text>
+  <Text
+    testID="mock-chart"
+  >
+    Mock LineChart con 
+    7
+     datasets
+  </Text>
+</View>
+`;
