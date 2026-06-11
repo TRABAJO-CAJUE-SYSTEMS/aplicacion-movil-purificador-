@@ -1,6 +1,6 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
-  getDatabase, ref, onValue, off,
+  getDatabase, ref, get, onValue, off,
   query, limitToLast, orderByKey, set,
   type Database, type DatabaseReference,
 } from 'firebase/database';
@@ -25,5 +25,5 @@ const firebaseConfig = {
 const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 const database: Database = getDatabase(app);
 
-export { database, ref, onValue, off, query, limitToLast, orderByKey, set };
+export { database, ref, get, onValue, off, query, limitToLast, orderByKey, set };
 export type { Database, DatabaseReference };

@@ -9,7 +9,7 @@ import {
 } from 'react-native';
 import Slider from '@react-native-community/slider';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { database, ref, set } from '../firebaseConfig';
+import { database, ref, set, get, auth } from '../firebaseConfig';
 import { useBleManager, DEVICE_NAME } from '../hooks/useBleManager';
 
 // ── Tipos ──────────────────────────────────────────────────────
@@ -20,6 +20,7 @@ type WizardStep =
 
 interface ConfigState {
   deviceId: string; deviceName: string; rssi: number;
+  nombreDispositivo: string; // nombre legible elegido por el usuario
   modificado: { wifi: boolean; ubicacion: boolean; pines: boolean; calibracion: boolean; umbrales: boolean };
   wifi_ssid: string; wifi_pass: string;
   ciudad: string; departamento: string; pais: string;
@@ -36,6 +37,7 @@ interface ConfigState {
 
 const DEFAULT_CONFIG: ConfigState = {
   deviceId: '', deviceName: '', rssi: -100,
+  nombreDispositivo: '',
   modificado: { wifi: false, ubicacion: false, pines: false, calibracion: false, umbrales: false },
   wifi_ssid: '', wifi_pass: '',
   ciudad: 'cochabamba', departamento: 'cochabamba', pais: 'Bolivia',
@@ -154,7 +156,13 @@ function GasSliders({
 // ════════════════════════════════════════════════════════════════
 //  CONFIG WIZARD — componente principal
 // ════════════════════════════════════════════════════════════════
-export default function ConfigWizard({ onClose }: { onClose: () => void }) {
+export default function ConfigWizard({
+  onClose,
+  existingDeviceId,
+}: {
+  onClose: () => void;
+  existingDeviceId?: string;
+}) {
   const [step,        setStep]        = useState<WizardStep>('scan');
   const [cfg,         setCfg]         = useState<ConfigState>(DEFAULT_CONFIG);
   const [showPass,    setShowPass]    = useState(false);
@@ -163,13 +171,31 @@ export default function ConfigWizard({ onClose }: { onClose: () => void }) {
   const blinkAnim = useRef(new Animated.Value(1)).current;
 
   const ble = useBleManager();
+  const uid = auth.currentUser?.uid ?? '';
 
-  // Cargar config guardada
+  // Cargar config en segundo plano — sin bloquear la apertura del wizard
   useEffect(() => {
-    AsyncStorage.getItem(STORAGE_KEY).then((s) => {
-      if (s) setCfg(prev => ({ ...prev, ...JSON.parse(s) }));
-    }).catch(() => {});
-  }, []);
+    if (existingDeviceId) {
+      if (uid) {
+        get(ref(database, `config_dispositivos/${uid}/${existingDeviceId}`))
+          .then((snap) => {
+            if (snap.exists()) {
+              const saved = snap.val();
+              setCfg(prev => ({
+                ...prev,
+                ...saved,
+                nombreDispositivo: saved.nombre ?? prev.nombreDispositivo,
+              }));
+            }
+          })
+          .catch(() => {});
+      }
+    } else {
+      AsyncStorage.getItem(STORAGE_KEY).then((s) => {
+        if (s) setCfg(prev => ({ ...prev, ...JSON.parse(s) }));
+      }).catch(() => {});
+    }
+  }, [existingDeviceId, uid]);
 
   // Animación punto BLE
   useEffect(() => {
@@ -199,10 +225,24 @@ export default function ConfigWizard({ onClose }: { onClose: () => void }) {
 
   // ── Guardar y enviar por BLE ──────────────────────────────
   const handleGuardarTodo = async () => {
+    // Si estamos editando, conservar el ID existente; si es nuevo, generarlo
+    const deviceId = existingDeviceId ?? (
+      (cfg.nombreDispositivo || cfg.ciudad || 'purificador')
+        .toLowerCase()
+        .replace(/\s+/g, '_')
+        .replace(/[^a-z0-9_]/g, '')
+        .slice(0, 30)
+    );
+
     setStep('guardando');
     setStatusMsg('Enviando configuración al purificador...');
     try {
       const payload = {
+        // Identidad del dispositivo (el ESP32 usará esto para sus rutas Firebase)
+        owner_uid:            uid,
+        device_id:            deviceId,
+        nombre:               cfg.nombreDispositivo || cfg.ciudad,
+        // Configuración
         wifi_ssid:            cfg.wifi_ssid,
         wifi_pass:            cfg.wifi_pass,
         ciudad:               cfg.ciudad,
@@ -240,13 +280,61 @@ export default function ConfigWizard({ onClose }: { onClose: () => void }) {
       // Guardar en AsyncStorage
       await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
 
-      // Guardar en Firebase
-      const key = cfg.deviceName.replace(/[^a-zA-Z0-9]/g, '_') || 'dispositivo';
-      await set(ref(database, `config_dispositivos/${key}`), {
-        ...payload,
-        guardado_el: new Date().toISOString(),
-        dispositivo: cfg.deviceName,
-      });
+      // Registrar dispositivo bajo el usuario en Firebase
+      if (uid && deviceId) {
+        // Pre-registrar en dispositivos/{uid}/{deviceId} para que aparezca en la app
+        await set(ref(database, `dispositivos/${uid}/${deviceId}`), {
+          nombre:      cfg.nombreDispositivo || cfg.ciudad,
+          ciudad:      cfg.ciudad,
+          latitud:     cfg.latitud,
+          longitud:    cfg.longitud,
+          calidad_aire: 'Inicializando',
+          co2_ppm:     0,
+          co_ppm:      0,
+          nh3_ppm:     0,
+          extractor:   'OFF',
+          modo:        'Automatico',
+          ultima_actualizacion: new Date().toISOString(),
+        });
+        // Guardar config bajo el usuario
+        await set(ref(database, `config_dispositivos/${uid}/${deviceId}`), {
+          ...payload,
+          guardado_el: new Date().toISOString(),
+          dispositivo_ble: cfg.deviceName,
+        });
+
+        // Sincronizar con la plataforma web — clave fija = sin duplicados al reconfigurar
+        try {
+          const webKey = `${uid}_${deviceId}`;
+          await set(ref(database, `dispositivos_registrados/${webKey}`), {
+            nombre:             cfg.nombreDispositivo || cfg.ciudad,
+            firebase_path:      cfg.ciudad,
+            clienteId:          '',
+            zonaId:             '',
+            ubicacion:          cfg.ciudad,
+            latitud:            cfg.latitud,
+            longitud:           cfg.longitud,
+            instalado_el:       Date.now(),
+            ultimo_filtro_hepa: Date.now(),
+            activo:             true,
+            es_publico:         false,
+            ownerUid:           uid,
+            wifi_ssid:          cfg.wifi_ssid || null,
+            wifi_configurado:   !!cfg.wifi_ssid,
+            notas:              `App móvil · BLE: ${cfg.deviceName}`,
+          });
+        } catch {
+          // Silencioso — la app móvil funciona sin este write
+        }
+      } else {
+        // Fallback sin uid (no debería pasar)
+        const key = cfg.deviceName.replace(/[^a-zA-Z0-9]/g, '_') || 'dispositivo';
+        await set(ref(database, `config_dispositivos/${key}`), {
+          ...payload,
+          guardado_el: new Date().toISOString(),
+          dispositivo: cfg.deviceName,
+        });
+      }
 
       if (response.status === 'ok') {
         setReiniciando(response.reiniciando ?? false);
@@ -272,6 +360,17 @@ export default function ConfigWizard({ onClose }: { onClose: () => void }) {
     <View style={wStyles.container}>
       <WizardHeader title="Buscar purificador" onClose={onClose} />
       <ScrollView contentContainerStyle={wStyles.body}>
+
+        {/* Instrucción para activar BLE en el ESP32 */}
+        <View style={[wStyles.infoBox, { marginBottom: 12, borderColor: '#FF980040', backgroundColor: '#fffbeb' }]}>
+          <Text style={{ fontSize: 13, fontWeight: '800', color: '#FF9800', marginBottom: 6 }}>
+            ⚡ Paso 1 — Activa el modo Bluetooth en el ESP32
+          </Text>
+          <Text style={{ fontSize: 13, color: '#a16207', lineHeight: 20 }}>
+            {'1. Mantén presionado el botón BOOT del ESP32\n   durante 3 segundos\n2. Suéltalo cuando el LED amarillo parpadee\n3. Vuelve aquí y pulsa "Iniciar búsqueda"'}
+          </Text>
+        </View>
+
         <TouchableOpacity
           style={[wStyles.primaryBtn, (ble.scanning || ble.connecting) && { backgroundColor: '#ccc' }]}
           onPress={ble.scanning ? ble.stopScan : ble.startScan}
@@ -303,7 +402,7 @@ export default function ConfigWizard({ onClose }: { onClose: () => void }) {
         {!ble.scanning && !ble.connecting && ble.devices.length === 0 && !ble.error && (
           <View style={wStyles.emptyBox}>
             <Text style={wStyles.emptyText}>
-              {'No se encontró ningún purificador.\n¿Está en modo configuración?\n\nPresiona BOOT del ESP32 durante 3 s — el LED amarillo debe parpadear.\n\nSi el LED parpadea y no aparece, asegúrate de que el nombre BLE del ESP32 sea "PurificadorIA".'}
+              {'No se detectó ningún dispositivo.\n\n¿El LED amarillo del ESP32 parpadea?\nSi no → mantén BOOT 3 s y vuelve a buscar.\n\nSi parpadea y no aparece → el nombre BLE debe ser "PurificadorIA".'}
             </Text>
           </View>
         )}
@@ -369,6 +468,18 @@ export default function ConfigWizard({ onClose }: { onClose: () => void }) {
       <View style={wStyles.bleIndicator}>
         <Animated.View style={[wStyles.bleDot, { opacity: blinkAnim }]} />
         <Text style={wStyles.bleText}>{cfg.deviceName} — conectado</Text>
+      </View>
+      {/* Nombre del dispositivo */}
+      <View style={wStyles.nombreRow}>
+        <Text style={wStyles.nombreLabel}>NOMBRE DEL DISPOSITIVO</Text>
+        <TextInput
+          style={wStyles.nombreInput}
+          placeholder="Ej: Sala de estar, Cocina, Oficina..."
+          placeholderTextColor="#aaa"
+          value={cfg.nombreDispositivo}
+          onChangeText={(v) => updateCfg({ nombreDispositivo: v })}
+          maxLength={30}
+        />
       </View>
       <Text style={wStyles.sectionLabel}>ELIGE QUÉ CONFIGURAR</Text>
       <ScrollView contentContainerStyle={wStyles.dashBody}>
@@ -781,6 +892,9 @@ const wStyles = StyleSheet.create({
   dashCardDesc:      { fontSize: 12, color: '#aaa', marginTop: 2 },
   modDot:            { width: 22, height: 22, borderRadius: 11, backgroundColor: '#00AFAA', alignItems: 'center', justifyContent: 'center' },
   modDotText:        { color: '#fff', fontSize: 11, fontWeight: '800' },
+  nombreRow:         { paddingHorizontal: 16, paddingBottom: 12 },
+  nombreLabel:       { fontSize: 10, fontWeight: '800', color: '#aaa', letterSpacing: 1.5, marginBottom: 6 },
+  nombreInput:       { backgroundColor: '#f5f5f5', borderRadius: 12, paddingHorizontal: 14, paddingVertical: 12, fontSize: 14, color: '#333', borderWidth: 1, borderColor: '#eee' },
   saveTodoBtn:       { position: 'absolute', bottom: 20, left: 16, right: 16, backgroundColor: '#007F7A', borderRadius: 16, paddingVertical: 16, alignItems: 'center', elevation: 8 },
   saveTodoBtnText:   { color: '#fff', fontWeight: '900', fontSize: 15, letterSpacing: 1 },
   saveBadge:         { position: 'absolute', top: -8, right: 16, backgroundColor: '#F44336', borderRadius: 10, minWidth: 20, height: 20, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 5 },

@@ -7,7 +7,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import Constants from 'expo-constants';
 import * as Notifications from 'expo-notifications';
 import Header from '../components/Header';
-import { database, ref, onValue } from '../firebaseConfig';
+import { database, ref, onValue, set, auth } from '../firebaseConfig';
 
 const isExpoGo = (() => {
   const constants = Constants as any;
@@ -17,6 +17,7 @@ const isExpoGo = (() => {
 })();
 
 interface DispositivoState {
+  nombre?:       string;
   calidad_aire:  string;
   co2_ppm:       number;
   co_ppm:        number;
@@ -26,12 +27,6 @@ interface DispositivoState {
   extractor:     string;
   ultima_actualizacion?: string;
 }
-
-const CIUDADES = [
-  { id: 'cochabamba', label: 'Cochabamba', color: '#00AFAA' },
-  { id: 'la_paz',     label: 'La Paz',     color: '#818cf8' },
-  { id: 'santa_cruz', label: 'Santa Cruz', color: '#f97316' },
-];
 
 function colorCalidad(c: string) {
   const v = (c ?? '').toLowerCase();
@@ -49,69 +44,101 @@ function textoSimple(c: string) {
 }
 
 export default function AlertasScreen() {
+  const uid = auth.currentUser?.uid ?? '';
+
   const [pushEnabled,  setPushEnabled]  = useState(true);
   const [umbralCO2,    setUmbralCO2]    = useState(1000);
   const [umbralCO,     setUmbralCO]     = useState(8.7);
   const [umbralPM25,   setUmbralPM25]   = useState(55);
-  const [datos, setDatos] = useState<Record<string, DispositivoState | null>>({
-    cochabamba: null, la_paz: null, santa_cruz: null,
-  });
-  const [alertasActivas, setAlertasActivas] = useState<{ ciudad: string; data: DispositivoState }[]>([]);
+  const [datos, setDatos]               = useState<Record<string, DispositivoState>>({});
+  const [alertasActivas, setAlertasActivas] = useState<{ id: string; nombre: string; data: DispositivoState }[]>([]);
   const notificadasRef = React.useRef<Set<string>>(new Set());
+  const umbralesGuardadosRef = React.useRef(false);
 
-  // Suscribir a /dispositivos/* de las 3 ciudades
+  // Cargar umbrales desde usuarios/{uid}/alertas/
   useEffect(() => {
-    const unsubs = CIUDADES.map(({ id }) =>
-      onValue(ref(database, `dispositivos/${id}`), (snap) => {
-        if (snap.exists()) {
-          setDatos((prev) => ({ ...prev, [id]: snap.val() as DispositivoState }));
-        }
-      })
-    );
-    return () => unsubs.forEach((fn) => fn());
-  }, []);
+    if (!uid) return;
+    const unsub = onValue(ref(database, `usuarios/${uid}/alertas`), (snap) => {
+      if (snap.exists() && !umbralesGuardadosRef.current) {
+        const d = snap.val();
+        if (d.co2  !== undefined) setUmbralCO2(d.co2);
+        if (d.co   !== undefined) setUmbralCO(d.co);
+        if (d.pm25 !== undefined) setUmbralPM25(d.pm25);
+      }
+    }, { onlyOnce: true });
+    return () => unsub();
+  }, [uid]);
+
+  // Guardar umbrales en Firebase cuando cambian
+  const guardarUmbrales = async (co2: number, co: number, pm25: number) => {
+    if (!uid) return;
+    umbralesGuardadosRef.current = true;
+    try {
+      await set(ref(database, `usuarios/${uid}/alertas`), { co2, co, pm25 });
+    } catch {}
+  };
+
+  // Escuchar dispositivos/{uid}/ — todos los del usuario
+  useEffect(() => {
+    if (!uid) return;
+    const unsub = onValue(ref(database, `dispositivos/${uid}`), (snap) => {
+      if (snap.exists()) {
+        setDatos(snap.val() as Record<string, DispositivoState>);
+      } else {
+        setDatos({});
+      }
+    });
+    return () => unsub();
+  }, [uid]);
 
   // Evaluar alertas cuando cambian los datos
   useEffect(() => {
-    const activas: { ciudad: string; data: DispositivoState }[] = [];
-    CIUDADES.forEach(({ id, label }) => {
-      const d = datos[id];
-      if (!d) return;
+    const activas: { id: string; nombre: string; data: DispositivoState }[] = [];
+    Object.entries(datos).forEach(([id, d]) => {
+      const nombre = d.nombre || id;
       const c = (d.calidad_aire ?? '').toLowerCase();
       const dispara = c === 'peligroso' ||
         (d.pm25_ugm3 ?? 0) > umbralPM25 ||
         (c === 'moderado' && ((d.co2_ppm ?? 0) > umbralCO2 || (d.co_ppm ?? 0) > umbralCO));
       if (dispara) {
-        activas.push({ ciudad: label, data: d });
-        // Notificación push (una vez por cambio)
+        activas.push({ id, nombre, data: d });
         const key = `${id}-${c}`;
         if (pushEnabled && !notificadasRef.current.has(key)) {
           notificadasRef.current.add(key);
-          if (!isExpoGo) { Notifications.scheduleNotificationAsync({
-            content: {
-              title: `⚠ Aire ${textoSimple(d.calidad_aire)} — ${label}`,
-              body: `Gas crítico: ${d.gas_critico || '—'} · PM2.5: ${(d.pm25_ugm3 ?? 0).toFixed(1)} μg/m³ · CO₂: ${(d.co2_ppm ?? 0).toFixed(0)} ppm. ${
-                c === 'peligroso'
-                  ? 'Evite salir. Active el purificador.'
-                  : 'Reduzca actividades al exterior.'}`,
-            },
-            trigger: null,
-          }).catch(() => {}); }
+          if (!isExpoGo) {
+            Notifications.scheduleNotificationAsync({
+              content: {
+                title: `⚠ Aire ${textoSimple(d.calidad_aire)} — Tu purificador: ${nombre}`,
+                body: `Gas crítico: ${d.gas_critico || '—'} · CO₂: ${(d.co2_ppm ?? 0).toFixed(0)} ppm · CO: ${(d.co_ppm ?? 0).toFixed(2)} ppm. ${
+                  c === 'peligroso'
+                    ? 'Evite salir. Active el purificador.'
+                    : 'Reduzca actividades al exterior.'}`,
+              },
+              trigger: null,
+            }).catch(() => {});
+          }
         }
       }
     });
     setAlertasActivas(activas);
-  }, [datos, umbralCO2, umbralCO, pushEnabled]);
+  }, [datos, umbralCO2, umbralCO, umbralPM25, pushEnabled]);
 
   const cambiarUmbral = (gas: 'co2' | 'co' | 'pm25', dir: 'up' | 'down') => {
+    let nuevoCO2 = umbralCO2, nuevoCO = umbralCO, nuevoPM25 = umbralPM25;
     if (gas === 'co2') {
-      setUmbralCO2((v) => Math.max(400, dir === 'up' ? v + 100 : v - 100));
+      nuevoCO2 = Math.max(400, dir === 'up' ? umbralCO2 + 100 : umbralCO2 - 100);
+      setUmbralCO2(nuevoCO2);
     } else if (gas === 'co') {
-      setUmbralCO((v) => Math.max(1, dir === 'up' ? Math.round((v + 1) * 10) / 10 : Math.round((v - 1) * 10) / 10));
+      nuevoCO = Math.max(1, dir === 'up' ? Math.round((umbralCO + 1) * 10) / 10 : Math.round((umbralCO - 1) * 10) / 10);
+      setUmbralCO(nuevoCO);
     } else {
-      setUmbralPM25((v) => Math.max(12, dir === 'up' ? v + 5 : v - 5));
+      nuevoPM25 = Math.max(12, dir === 'up' ? umbralPM25 + 5 : umbralPM25 - 5);
+      setUmbralPM25(nuevoPM25);
     }
+    guardarUmbrales(nuevoCO2, nuevoCO, nuevoPM25);
   };
+
+  const listaDispositivos = Object.entries(datos);
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -154,32 +181,34 @@ export default function AlertasScreen() {
           ))}
         </View>
 
-        {/* Estado por ciudad */}
-        <Text style={styles.sectionTitle}>Estado en tiempo real</Text>
-        {CIUDADES.map(({ id, label }) => {
-          const d = datos[id];
-          const color = colorCalidad(d?.calidad_aire ?? '');
-          return (
-            <View key={id} style={[styles.ciudadCard, { borderColor: color + '40' }]}>
-              <View style={[styles.dot, { backgroundColor: d ? color : '#ddd' }]} />
-              <View style={{ flex: 1 }}>
-                <Text style={styles.ciudadLabel}>{label}</Text>
-                {d ? (
+        {/* Estado en tiempo real — dispositivos del usuario */}
+        <Text style={styles.sectionTitle}>Mis purificadores en tiempo real</Text>
+
+        {listaDispositivos.length === 0 ? (
+          <View style={styles.emptyCard}>
+            <Text style={styles.emptyText}>📡 Sin purificadores registrados</Text>
+            <Text style={styles.emptyDesc}>Ve a Dispositivos → Agregar purificador</Text>
+          </View>
+        ) : (
+          listaDispositivos.map(([id, d]) => {
+            const color = colorCalidad(d.calidad_aire);
+            const nombre = d.nombre || id;
+            return (
+              <View key={id} style={[styles.ciudadCard, { borderColor: color + '40' }]}>
+                <View style={[styles.dot, { backgroundColor: color }]} />
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.ciudadLabel}>{nombre}</Text>
                   <Text style={styles.ciudadGases}>
                     PM2.5: {(d.pm25_ugm3 ?? 0).toFixed(1)} μg/m³ · CO₂: {(d.co2_ppm ?? 0).toFixed(0)} · CO: {(d.co_ppm ?? 0).toFixed(2)}
                   </Text>
-                ) : (
-                  <Text style={styles.ciudadGases}>Sin datos</Text>
-                )}
+                </View>
+                <View style={[styles.aqiBadge, { backgroundColor: color + '15' }]}>
+                  <Text style={[styles.aqiBadgeText, { color }]}>{textoSimple(d.calidad_aire)}</Text>
+                </View>
               </View>
-              <View style={[styles.aqiBadge, { backgroundColor: color + '15' }]}>
-                <Text style={[styles.aqiBadgeText, { color }]}>
-                  {d ? textoSimple(d.calidad_aire) : '—'}
-                </Text>
-              </View>
-            </View>
-          );
-        })}
+            );
+          })
+        )}
 
         {/* Alertas activas */}
         {alertasActivas.length > 0 && (
@@ -193,7 +222,7 @@ export default function AlertasScreen() {
                 <View key={i} style={[styles.alertaCard, { borderColor: color + '50', backgroundColor: color + '08' }]}>
                   <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}>
                     <Text style={{ fontSize: 18, marginRight: 8 }}>⚠</Text>
-                    <Text style={[styles.alertaCiudad, { color }]}>{a.ciudad}</Text>
+                    <Text style={[styles.alertaCiudad, { color }]}>Tu purificador: {a.nombre}</Text>
                     <View style={[styles.alertaBadge, { backgroundColor: color + '20', borderColor: color + '40' }]}>
                       <Text style={[styles.alertaBadgeText, { color }]}>
                         {(a.data.calidad_aire ?? '').toUpperCase()}
@@ -217,11 +246,11 @@ export default function AlertasScreen() {
         )}
 
         {/* Todo bien */}
-        {alertasActivas.length === 0 && (
+        {listaDispositivos.length > 0 && alertasActivas.length === 0 && (
           <View style={styles.okCard}>
             <Text style={{ fontSize: 40, marginBottom: 10 }}>✓</Text>
             <Text style={styles.okTitle}>Todo en orden</Text>
-            <Text style={styles.okSub}>Calidad del aire dentro de los rangos seguros.</Text>
+            <Text style={styles.okSub}>Todos tus purificadores dentro de rangos seguros.</Text>
           </View>
         )}
       </ScrollView>
@@ -250,8 +279,11 @@ const styles = StyleSheet.create({
   ciudadGases:    { fontSize: 11, color: '#888', marginTop: 2 },
   aqiBadge:       { borderRadius: 10, paddingHorizontal: 10, paddingVertical: 4 },
   aqiBadgeText:   { fontSize: 10, fontWeight: '800' },
+  emptyCard:      { backgroundColor: '#fff', borderRadius: 14, padding: 24, alignItems: 'center', elevation: 1 },
+  emptyText:      { fontSize: 14, fontWeight: '700', color: '#555', marginBottom: 6 },
+  emptyDesc:      { fontSize: 12, color: '#aaa', textAlign: 'center' },
   alertaCard:     { backgroundColor: '#fff', borderRadius: 16, borderWidth: 1.5, padding: 16, marginBottom: 12, elevation: 2 },
-  alertaCiudad:   { fontSize: 16, fontWeight: '900', flex: 1 },
+  alertaCiudad:   { fontSize: 14, fontWeight: '900', flex: 1 },
   alertaBadge:    { borderRadius: 10, paddingHorizontal: 10, paddingVertical: 4, borderWidth: 1 },
   alertaBadgeText:{ fontSize: 10, fontWeight: '800' },
   alertaLine:     { fontSize: 12, color: '#555', marginBottom: 4 },

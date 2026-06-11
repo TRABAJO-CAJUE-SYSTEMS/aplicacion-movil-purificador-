@@ -64,7 +64,6 @@
           ]
         }
       ],
-      "expo-dev-client",
       "expo-web-browser"
     ]
   }

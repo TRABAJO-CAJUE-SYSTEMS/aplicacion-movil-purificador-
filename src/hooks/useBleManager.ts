@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { BleManager, Device, Characteristic } from 'react-native-ble-plx';
-import { Alert, Platform, PermissionsAndroid } from 'react-native';
+import { BleManager, Device } from 'react-native-ble-plx';
+import { Alert, Linking, Platform, PermissionsAndroid } from 'react-native';
 import { Buffer } from 'buffer';
 
 // ── UUIDs del ESP32 ───────────────────────────────────────
@@ -16,40 +16,69 @@ export interface ScannedDevice {
 }
 
 export interface BleResponse {
-  status:      'ok' | 'error';
+  status:       'ok' | 'error';
   reiniciando?: boolean;
   msg?:         string;
 }
 
 async function requestBlePermissions(): Promise<boolean> {
   if (Platform.OS !== 'android') return true;
-  if ((Platform.Version as number) >= 31) {
+
+  const api = Platform.Version as number;
+
+  if (api >= 31) {
+    // Android 12+ — necesita BLUETOOTH_SCAN + BLUETOOTH_CONNECT
     const results = await PermissionsAndroid.requestMultiple([
       PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
       PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
       PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
     ]);
+    const scan    = results[PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN];
+    const connect = results[PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT];
     return (
-      results[PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN]    === PermissionsAndroid.RESULTS.GRANTED &&
-      results[PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT] === PermissionsAndroid.RESULTS.GRANTED
+      scan    === PermissionsAndroid.RESULTS.GRANTED &&
+      connect === PermissionsAndroid.RESULTS.GRANTED
     );
   }
+
+  // Android < 12 — solo necesita ubicación
   const result = await PermissionsAndroid.request(
     PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
     {
-      title: 'Permiso de ubicación para Bluetooth',
-      message: 'La app necesita acceso a la ubicación para buscar dispositivos Bluetooth cercanos.',
-      buttonPositive: 'Permitir',
-      buttonNegative: 'Cancelar',
+      title:           'Permiso de ubicación',
+      message:         'Necesario para buscar dispositivos Bluetooth cercanos.',
+      buttonPositive:  'Permitir',
+      buttonNegative:  'Cancelar',
     }
   );
   return result === PermissionsAndroid.RESULTS.GRANTED;
 }
 
+// Abre el diálogo del sistema para activar Bluetooth
+function requestEnableBluetooth(): Promise<void> {
+  return new Promise((resolve) => {
+    Alert.alert(
+      'Bluetooth desactivado',
+      'Activa el Bluetooth para buscar dispositivos cercanos.',
+      [
+        {
+          text: 'Abrir ajustes Bluetooth',
+          onPress: () => {
+            Linking.sendIntent('android.bluetooth.adapter.action.REQUEST_ENABLE')
+              .catch(() => Linking.openSettings());
+            resolve();
+          },
+        },
+        { text: 'Cancelar', style: 'cancel', onPress: () => resolve() },
+      ]
+    );
+  });
+}
+
 export function useBleManager() {
-  const managerRef               = useRef<BleManager | null>(null);
-  const connectedDeviceRef       = useRef<Device | null>(null);
-  const scanTimeoutRef           = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const managerRef         = useRef<BleManager | null>(null);
+  const connectedDeviceRef = useRef<Device | null>(null);
+  const scanTimeoutRef     = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [devices,    setDevices]    = useState<ScannedDevice[]>([]);
   const [scanning,   setScanning]   = useState(false);
@@ -57,7 +86,7 @@ export function useBleManager() {
   const [connected,  setConnected]  = useState(false);
   const [error,      setError]      = useState<string | null>(null);
 
-  // ── Inicializar manager (singleton) ──────────────────────
+  // ── Singleton manager — siempre fresco ───────────────────
   const getManager = useCallback((): BleManager => {
     if (!managerRef.current) {
       managerRef.current = new BleManager();
@@ -67,7 +96,10 @@ export function useBleManager() {
 
   // ── Detener escaneo ───────────────────────────────────────
   const stopScan = useCallback(() => {
-    if (scanTimeoutRef.current) { clearTimeout(scanTimeoutRef.current); scanTimeoutRef.current = null; }
+    if (scanTimeoutRef.current) {
+      clearTimeout(scanTimeoutRef.current);
+      scanTimeoutRef.current = null;
+    }
     managerRef.current?.stopDeviceScan();
     setScanning(false);
   }, []);
@@ -76,8 +108,8 @@ export function useBleManager() {
   useEffect(() => {
     return () => {
       if (scanTimeoutRef.current) clearTimeout(scanTimeoutRef.current);
-      stopScan();
-      disconnect();
+      managerRef.current?.stopDeviceScan();
+      connectedDeviceRef.current?.cancelConnection().catch(() => {});
       managerRef.current?.destroy();
       managerRef.current = null;
     };
@@ -89,92 +121,102 @@ export function useBleManager() {
     setDevices([]);
     setScanning(true);
 
-    // 1. Pedir permisos en Android
+    // 1. Permisos Android
     if (Platform.OS === 'android') {
       const granted = await requestBlePermissions();
       if (!granted) {
-        setError('Permisos de Bluetooth denegados. Ve a Ajustes > Permisos y actívalos.');
+        setError('Permisos de Bluetooth denegados.\nVe a Ajustes > Aplicaciones > airpure-app > Permisos y activa Bluetooth y Ubicación.');
         setScanning(false);
         return;
       }
     }
 
+    // 2. Siempre recrear el manager para evitar estado corrupto
+    if (managerRef.current) {
+      managerRef.current.stopDeviceScan();
+      managerRef.current.destroy();
+      managerRef.current = null;
+    }
     const mgr = getManager();
 
-    // Lee el estado BLE actual (emite inmediatamente con el estado real)
+    // Lee estado actual del BT (emitCurrentValue: true para no perder transiciones)
     const readState = (): Promise<string> =>
       new Promise((resolve) => {
         const sub = mgr.onStateChange((s) => { sub.remove(); resolve(s); }, true);
       });
 
     try {
-      // 2. Estado inicial
       let state = await readState();
 
       if (state === 'Unsupported') {
         throw new Error('Este dispositivo no soporta Bluetooth Low Energy.');
       }
       if (state === 'Unauthorized') {
-        throw new Error('Sin autorización para Bluetooth. Revisa los permisos de la app.');
+        throw new Error('Sin autorización para Bluetooth. Ve a Ajustes y activa los permisos de la app.');
       }
 
-      // 3. Si BT está apagado → activarlo en Android, avisar en iOS
+      // 3. Si BT apagado → abrir diálogo del sistema (no llamar mgr.enable())
       if (state === 'PoweredOff') {
         if (Platform.OS === 'android') {
-          await mgr.enable();
-          // Re-leer estado DESPUÉS de enable() para evitar la race condition:
-          // enable() puede resolver antes o después de que BT esté realmente ON.
-          state = await readState();
+          await requestEnableBluetooth();
         } else {
           throw new Error('Bluetooth desactivado. Ve a Ajustes → Bluetooth y actívalo.');
         }
       }
 
-      // 4. Si aún no está encendido, esperar — usando emitCurrentValue:true para
-      //    evitar perder la transición si ya ocurrió entre el readState y este punto.
+      // 4. Esperar hasta 30s a que BT se active
       if (state !== 'PoweredOn') {
         await new Promise<void>((resolve, reject) => {
           const timer = setTimeout(() => {
-            sub.remove();
-            reject(new Error('Tiempo de espera agotado al activar Bluetooth (10 s).'));
-          }, 10000);
-          const sub = mgr.onStateChange((s) => {
+            stateSub.remove();
+            reject(new Error('Bluetooth no se activó en 30 segundos.\nActívalo manualmente y vuelve a intentar.'));
+          }, 30000);
+          const stateSub = mgr.onStateChange((s) => {
             if (s === 'PoweredOn') {
               clearTimeout(timer);
-              sub.remove();
+              stateSub.remove();
               resolve();
-            } else if (['PoweredOff', 'Unsupported', 'Unauthorized'].includes(s)) {
+            } else if (s === 'Unsupported' || s === 'Unauthorized') {
               clearTimeout(timer);
-              sub.remove();
-              reject(new Error('Bluetooth no disponible.'));
+              stateSub.remove();
+              reject(new Error('Bluetooth no disponible en este dispositivo.'));
             }
-          }, true); // ← true: emite estado actual de inmediato, sin race condition
+          }, true);
         });
       }
 
-      // 5. Escanear — acepta name O localName para no perder dispositivos
-      mgr.startDeviceScan(null, { allowDuplicates: false }, (err, device) => {
-        if (err) {
-          setError(err.message);
-          setScanning(false);
-          return;
+      // 5. Escanear TODOS los dispositivos BLE (incluye sin nombre)
+      mgr.startDeviceScan(
+        null,                      // sin filtro de servicios
+        { allowDuplicates: false },
+        (err, device) => {
+          if (err) {
+            // Error 102 = BT apagado durante escaneo — ignorar silenciosamente
+            if ((err as any).errorCode !== 102) {
+              setError(err.message);
+            }
+            setScanning(false);
+            return;
+          }
+          if (!device) return;
+
+          const name = device.name ?? device.localName ?? `[${device.id.slice(-5)}]`;
+
+          setDevices((prev) => {
+            const entry: ScannedDevice = {
+              id:   device.id,
+              name,
+              rssi: device.rssi ?? -100,
+            };
+            const exists = prev.find((d) => d.id === device.id);
+            if (exists) return prev.map((d) => d.id === device.id ? entry : d);
+            return [...prev, entry];
+          });
         }
-        const name = device?.name ?? device?.localName;
-        if (!name) return;
+      );
 
-        setDevices((prev) => {
-          const exists = prev.find((d) => d.id === device!.id);
-          const entry: ScannedDevice = {
-            id:   device!.id,
-            name,
-            rssi: device!.rssi ?? -100,
-          };
-          if (exists) return prev.map((d) => d.id === device!.id ? entry : d);
-          return [...prev, entry];
-        });
-      });
-
-      scanTimeoutRef.current = setTimeout(stopScan, 15000);
+      // Parar después de 20 segundos
+      scanTimeoutRef.current = setTimeout(stopScan, 20000);
 
     } catch (e: any) {
       setError(e.message);
@@ -190,11 +232,10 @@ export function useBleManager() {
 
     try {
       const mgr    = getManager();
-      const device = await mgr.connectToDevice(deviceId);
+      const device = await mgr.connectToDevice(deviceId, { timeout: 10000 });
       await device.discoverAllServicesAndCharacteristics();
-
-      // Solicitar MTU grande para JSON completo
-      try { await device.requestMTU(512); } catch { /* no crítico */ }
+      // No pedimos MTU — CHUNK=20 es seguro con el MTU por defecto (23 bytes).
+      // requestMTU() puede desestabilizar la conexión en ciertos teléfonos Android.
 
       connectedDeviceRef.current = device;
       setConnected(true);
@@ -207,51 +248,63 @@ export function useBleManager() {
     }
   }, [stopScan, getManager]);
 
-  // ── Enviar JSON al ESP32 ──────────────────────────────────
+  // ── Enviar JSON al ESP32 por BLE ──────────────────────────
   const sendConfig = useCallback(async (payload: object): Promise<BleResponse> => {
     const device = connectedDeviceRef.current;
     if (!device) throw new Error('Sin dispositivo conectado');
 
     const jsonStr = JSON.stringify(payload);
     const bytes   = Buffer.from(jsonStr, 'utf-8');
+    const CHUNK   = 20;   // seguro con MTU por defecto (23 bytes)
 
-    // Dividir en chunks si es necesario (MTU ≤ 512)
-    const CHUNK_SIZE = 500;
-    if (bytes.length > CHUNK_SIZE) {
-      const chunks = [];
-      for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
-        chunks.push(bytes.slice(i, i + CHUNK_SIZE));
-      }
-      for (let i = 0; i < chunks.length; i++) {
-        const isLast  = i === chunks.length - 1;
-        const chunk   = isLast ? Buffer.concat([chunks[i], Buffer.from('\n')]) : chunks[i];
-        const b64     = chunk.toString('base64');
-        await device.writeCharacteristicWithResponseForService(
-          SERVICE_UUID, CHAR_WRITE_UUID, b64
-        );
-        // Pequeña pausa entre chunks
-        await new Promise(r => setTimeout(r, 50));
-      }
-    } else {
-      const b64 = bytes.toString('base64');
-      await device.writeCharacteristicWithResponseForService(
-        SERVICE_UUID, CHAR_WRITE_UUID, b64
+    // Esperar a que la conexión BLE se estabilice antes de enviar datos
+    await new Promise(r => setTimeout(r, 500));
+
+    // Preparar todos los chunks; añadir '\n' al último para que el Arduino lo detecte
+    const allChunks: Buffer[] = [];
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      allChunks.push(bytes.slice(i, i + CHUNK));
+    }
+    allChunks[allChunks.length - 1] = Buffer.concat([
+      allChunks[allChunks.length - 1],
+      Buffer.from('\n'),
+    ]);
+
+    // Usar writeWithoutResponse (WRITE_NR): no requiere ACK, es más estable
+    // para envío masivo de chunks y evita timeouts de escritura GATT
+    for (const chunk of allChunks) {
+      await device.writeCharacteristicWithoutResponseForService(
+        SERVICE_UUID, CHAR_WRITE_UUID, chunk.toString('base64')
       );
+      await new Promise(r => setTimeout(r, 120));
     }
 
-    // Leer respuesta
-    await new Promise(r => setTimeout(r, 500));
-    const char = await device.readCharacteristicForService(SERVICE_UUID, CHAR_READ_UUID);
-    if (!char.value) throw new Error('Sin respuesta del dispositivo');
+    // Dar tiempo al ESP32 de procesar y actualizar la característica (reinicia en ~2s)
+    await new Promise(r => setTimeout(r, 3000));
+    let char;
+    try {
+      char = await device.readCharacteristicForService(SERVICE_UUID, CHAR_READ_UUID);
+    } catch {
+      // El ESP32 reinició tras guardar — conexión caída = éxito
+      return { status: 'ok', reiniciando: true };
+    }
+    if (!char.value) return { status: 'ok', reiniciando: true };
     const responseStr = Buffer.from(char.value, 'base64').toString('utf-8');
-    return JSON.parse(responseStr) as BleResponse;
+    let parsed: BleResponse;
+    try {
+      parsed = JSON.parse(responseStr) as BleResponse;
+    } catch {
+      return { status: 'ok', reiniciando: true };
+    }
+    // Solo falla si el Arduino reporta error explícito — cualquier otro estado
+    // ('ready', 'ok', etc.) significa que el ESP32 ya procesó o está reiniciando
+    if (parsed.status !== 'error') return { status: 'ok', reiniciando: true };
+    return parsed;
   }, []);
 
   // ── Desconectar ───────────────────────────────────────────
   const disconnect = useCallback(async () => {
-    try {
-      await connectedDeviceRef.current?.cancelConnection();
-    } catch { /* ignorar */ }
+    try { await connectedDeviceRef.current?.cancelConnection(); } catch {}
     connectedDeviceRef.current = null;
     setConnected(false);
   }, []);

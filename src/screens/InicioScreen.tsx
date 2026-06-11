@@ -7,7 +7,7 @@ import * as Location from 'expo-location';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Header from '../components/Header';
 import TrendChart from '../components/TrendChart';
-import { database, ref, onValue, query, limitToLast, orderByKey } from '../firebaseConfig';
+import { database, ref, onValue, query, limitToLast, orderByKey, auth } from '../firebaseConfig';
 import { C, R, aqiColor, aqiDim, aqiLabel, aqiEmoji, aqiFromPM25, AQI_LEVELS } from '../theme';
 
 interface SensorData {
@@ -25,6 +25,9 @@ interface TrendData {
 interface OpenAQMeasurement {
   parameter: string; value: number; unit: string; lastUpdated: string;
 }
+interface DispositivoInfo {
+  id: string; nombre: string; ciudad: string; latitud?: number; longitud?: number;
+}
 
 function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const R = 6371, dLat = (lat2-lat1)*Math.PI/180, dLon = (lon2-lon1)*Math.PI/180;
@@ -36,16 +39,6 @@ function tiempoCaminando(km: number) {
   const mins = Math.round((km/5)*60);
   return mins < 60 ? `${mins} min` : `${Math.floor(mins/60)}h ${mins%60}min`;
 }
-const ESTACIONES = [
-  { id: 'cochabamba', nombre: 'Cochabamba', lat: -17.3935, lon: -66.1570 },
-  { id: 'la_paz',     nombre: 'La Paz',     lat: -16.5000, lon: -68.1500 },
-  { id: 'santa_cruz', nombre: 'Santa Cruz', lat: -17.7833, lon: -63.1821 },
-];
-const CIUDADES = [
-  { id: 'cochabamba', label: 'Cbba.' },
-  { id: 'la_paz',     label: 'La Paz' },
-  { id: 'santa_cruz', label: 'Sta. Cruz' },
-];
 
 // ── Barra de gas animada ──────────────────────────────────
 function GasBar({ label, value, max, color, unit, alert }: {
@@ -75,7 +68,6 @@ function GasBar({ label, value, max, color, unit, alert }: {
 // ── AQI Ring ──────────────────────────────────────────────
 function AQIRing({ calidad, pm25 }: { calidad: string; pm25?: number }) {
   const pulse = useRef(new Animated.Value(1)).current;
-  // Si hay PM2.5, usa el nivel AQI basado en él; si no, usa la clasificación del ESP32
   const aqiKey = pm25 != null && pm25 > 0 ? aqiFromPM25(pm25) : (calidad.toLowerCase() as any);
   const color = aqiColor(aqiKey);
   const label = aqiLabel(aqiKey);
@@ -102,51 +94,101 @@ function AQIRing({ calidad, pm25 }: { calidad: string; pm25?: number }) {
 }
 
 export default function InicioScreen() {
-  const [ciudad,   setCiudad]   = useState('cochabamba');
-  const [data,     setData]     = useState<SensorData | null>(null);
-  const [trendData,setTrendData]= useState<TrendData>({ labels:[], co2:[], co:[], nh3:[], pm25:[], cov:[], alcohol:[], benceno:[], humo:[], h2:[] });
-  const [loading,  setLoading]  = useState(true);
-  const [nearest,  setNearest]  = useState<{ nombre: string; lat: number; lon: number; km: number } | null>(null);
-  const [searching,setSearching]= useState(false);
-  const [openaq,   setOpenaq]   = useState<OpenAQMeasurement[]>([]);
-  const [loadingOAQ, setLoadingOAQ] = useState(false);
+  const uid = auth.currentUser?.uid ?? '';
 
+  const [dispositivos,    setDispositivos]    = useState<DispositivoInfo[]>([]);
+  const [dispositivoSel,  setDispositivoSel]  = useState<string>('');
+  const [data,            setData]            = useState<SensorData | null>(null);
+  const [trendData,       setTrendData]       = useState<TrendData>({ labels:[], co2:[], co:[], nh3:[], pm25:[], cov:[], alcohol:[], benceno:[], humo:[], h2:[] });
+  const [loading,         setLoading]         = useState(true);
+  const [nearest,         setNearest]         = useState<{ nombre: string; lat: number; lon: number; km: number } | null>(null);
+  const [searching,       setSearching]       = useState(false);
+  const [openaq,          setOpenaq]          = useState<OpenAQMeasurement[]>([]);
+  const [loadingOAQ,      setLoadingOAQ]      = useState(false);
+
+  // Cargar dispositivos del usuario
   useEffect(() => {
-    setLoading(true); setData(null);
-    const q = query(ref(database, `data/${ciudad}`), orderByKey(), limitToLast(1));
-    const unsub = onValue(q, (snap) => {
-      if (snap.val()) {
-        const d = Object.values(snap.val())[0] as SensorData;
-        setData(d);
-        const ts = new Date();
-        const label = `${ts.getHours().toString().padStart(2,'0')}:${ts.getMinutes().toString().padStart(2,'0')}`;
-        setTrendData(prev => {
-          const limit = 10;
-          const push = (arr: number[], v?: number) => [...arr, v ?? 0].slice(-limit);
-          return {
-            labels:  [...prev.labels,  label].slice(-limit),
-            co2:     push(prev.co2,     d.co2_ppm),
-            co:      push(prev.co,      d.co_ppm),
-            nh3:     push(prev.nh3,     d.nh3_ppm),
-            pm25:    push(prev.pm25,    d.pm25_ugm3),
-            cov:     push(prev.cov,     d.cov_ppm),
-            alcohol: push(prev.alcohol, d.alcohol_ppm),
-            benceno: push(prev.benceno, d.benceno_ppm),
-            humo:    push(prev.humo,    d.humo_ppm),
-            h2:      push(prev.h2,      d.h2_ppm),
-          };
-        });
+    if (!uid) { setLoading(false); return; }
+    const unsub = onValue(ref(database, `dispositivos/${uid}`), (snap) => {
+      if (snap.exists()) {
+        const data = snap.val() as Record<string, any>;
+        const lista: DispositivoInfo[] = Object.entries(data).map(([id, d]) => ({
+          id,
+          nombre:   d.nombre   || id,
+          ciudad:   d.ciudad   || '—',
+          latitud:  d.latitud,
+          longitud: d.longitud,
+        }));
+        setDispositivos(lista);
+        if (!dispositivoSel && lista.length > 0) {
+          setDispositivoSel(lista[0].id);
+        }
+      } else {
+        setDispositivos([]);
+      }
+    });
+    return () => unsub();
+  }, [uid]);
+
+  // Datos en TIEMPO REAL desde /dispositivos/ — actualiza cada 15 s (set, no crece)
+  useEffect(() => {
+    if (!uid || !dispositivoSel) { setLoading(false); return; }
+    setLoading(true);
+    setData(null);
+    const unsub = onValue(ref(database, `dispositivos/${uid}/${dispositivoSel}`), (snap) => {
+      if (snap.exists()) {
+        const d = snap.val();
+        setData({
+          ...d,
+          // Normalizar nombre del campo entre Arduino v4 y versiones anteriores
+          gas_activador: d.gas_critico ?? d.gas_activador ?? 'Ninguno',
+          timestamp:     d.ultima_actualizacion ?? d.timestamp ?? '',
+        } as SensorData);
       }
       setLoading(false);
     });
     return () => unsub();
-  }, [ciudad]);
+  }, [uid, dispositivoSel]);
 
-  // Datos de referencia OpenAQ (estación oficial Cochabamba)
+  // Gráfica de tendencia desde /data/ — últimos 10 registros históricos (cada 5 min)
   useEffect(() => {
-    if (ciudad !== 'cochabamba') return;
+    if (!uid || !dispositivoSel) return;
+    const q = query(ref(database, `data/${uid}/${dispositivoSel}`), orderByKey(), limitToLast(10));
+    const unsub = onValue(q, (snap) => {
+      if (!snap.exists()) return;
+      const registros = Object.entries(snap.val())
+        .map(([k, v]: any) => ({ _key: k, ...v }))
+        .sort((a, b) => a._key.localeCompare(b._key));
+      const nuevo: TrendData = {
+        labels: [], co2: [], co: [], nh3: [], pm25: [], cov: [],
+        alcohol: [], benceno: [], humo: [], h2: [],
+      };
+      registros.forEach(d => {
+        const hora = d.timestamp
+          ? (d.timestamp as string).split(' ')[1]?.slice(0, 5) ?? ''
+          : '';
+        nuevo.labels.push(hora);
+        nuevo.co2.push(d.co2_ppm ?? 0);
+        nuevo.co.push(d.co_ppm ?? 0);
+        nuevo.nh3.push(d.nh3_ppm ?? 0);
+        nuevo.pm25.push(d.pm25_ugm3 ?? 0);
+        nuevo.cov.push(d.cov_ppm ?? 0);
+        nuevo.alcohol.push(d.alcohol_ppm ?? 0);
+        nuevo.benceno.push(d.benceno_ppm ?? 0);
+        nuevo.humo.push(d.humo_ppm ?? 0);
+        nuevo.h2.push(d.h2_ppm ?? 0);
+      });
+      setTrendData(nuevo);
+    });
+    return () => unsub();
+  }, [uid, dispositivoSel]);
+
+  // OpenAQ para el dispositivo seleccionado (si tiene coordenadas)
+  useEffect(() => {
+    const dev = dispositivos.find(d => d.id === dispositivoSel);
+    if (!dev?.latitud || !dev?.longitud) return;
     setLoadingOAQ(true);
-    fetch('https://api.openaq.org/v3/locations?coordinates=-17.3935,-66.1570&radius=50000&limit=3&parameters_id=2,5,6', {
+    fetch(`https://api.openaq.org/v3/locations?coordinates=${dev.latitud},${dev.longitud}&radius=50000&limit=3&parameters_id=2,5,6`, {
       headers: { Accept: 'application/json' },
     })
       .then(r => r.json())
@@ -163,7 +205,7 @@ export default function InicioScreen() {
       })
       .catch(() => {})
       .finally(() => setLoadingOAQ(false));
-  }, [ciudad]);
+  }, [dispositivoSel, dispositivos]);
 
   const handleFindNearest = async () => {
     setSearching(true);
@@ -172,10 +214,15 @@ export default function InicioScreen() {
       if (status !== 'granted') { Alert.alert('Permiso denegado'); return; }
       const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
       const { latitude: lat, longitude: lon } = loc.coords;
-      let mejor = ESTACIONES[0];
-      let minDist = haversineKm(lat, lon, ESTACIONES[0].lat, ESTACIONES[0].lon);
-      ESTACIONES.forEach(e => { const d = haversineKm(lat, lon, e.lat, e.lon); if (d < minDist) { minDist = d; mejor = e; } });
-      setNearest({ nombre: mejor.nombre, lat: mejor.lat, lon: mejor.lon, km: minDist });
+      const candidatos = dispositivos.filter(d => d.latitud && d.longitud);
+      if (candidatos.length === 0) { Alert.alert('Sin dispositivos con coordenadas'); return; }
+      let mejor = candidatos[0];
+      let minDist = haversineKm(lat, lon, mejor.latitud!, mejor.longitud!);
+      candidatos.forEach(e => {
+        const d = haversineKm(lat, lon, e.latitud!, e.longitud!);
+        if (d < minDist) { minDist = d; mejor = e; }
+      });
+      setNearest({ nombre: mejor.nombre, lat: mejor.latitud!, lon: mejor.longitud!, km: minDist });
     } catch { Alert.alert('Error', 'No se pudo obtener la ubicación'); }
     finally { setSearching(false); }
   };
@@ -188,23 +235,31 @@ export default function InicioScreen() {
       .catch(() => {});
   };
 
-  const color = data ? aqiColor(data.calidad_aire) : C.textMuted;
-
   return (
     <View style={styles.screen}>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <Header title="Inicio" subtitle="Monitor en tiempo real" />
       <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}>
 
-        {/* ── Selector de ciudad ── */}
-        <View style={styles.cityRow}>
-          {CIUDADES.map(c => (
-            <TouchableOpacity key={c.id} onPress={() => setCiudad(c.id)}
-              style={[styles.cityBtn, ciudad === c.id && { backgroundColor: C.tealDim, borderColor: C.teal }]}>
-              <Text style={[styles.cityLabel, ciudad === c.id && { color: C.teal }]}>{c.label}</Text>
-            </TouchableOpacity>
-          ))}
-        </View>
+        {/* ── Selector de dispositivo ── */}
+        {dispositivos.length === 0 ? (
+          <View style={styles.noDevCard}>
+            <Text style={styles.noDevText}>📡 Sin purificadores registrados</Text>
+            <Text style={styles.noDevSub}>Ve a Dispositivos → Agregar purificador</Text>
+          </View>
+        ) : (
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 12 }}>
+            {dispositivos.map(d => (
+              <TouchableOpacity key={d.id} onPress={() => setDispositivoSel(d.id)}
+                style={[styles.devBtn, dispositivoSel === d.id && { backgroundColor: C.tealDim, borderColor: C.teal }]}>
+                <Text style={[styles.devBtnLabel, dispositivoSel === d.id && { color: C.teal }]}>
+                  {d.nombre}
+                </Text>
+                <Text style={styles.devBtnCiudad}>{d.ciudad}</Text>
+              </TouchableOpacity>
+            ))}
+          </ScrollView>
+        )}
 
         {/* ── AQI Principal ── */}
         {loading ? (
@@ -218,57 +273,52 @@ export default function InicioScreen() {
           </View>
         ) : (
           <>
-            {/* Ring + info principal */}
             <View style={styles.mainCard}>
               <View style={styles.mainCardInner}>
                 <AQIRing calidad={data.calidad_aire} pm25={data.pm25_ugm3} />
                 <View style={styles.mainInfo}>
-                  {/* Confianza IA */}
                   {(data.confianza_ia ?? 0) > 0 && (
                     <View style={styles.iaBadge}>
                       <Text style={styles.iaBadgeText}>🧠 Edge Impulse v4</Text>
                       <Text style={[styles.iaConf, { color: C.teal }]}>{(data.confianza_ia ?? 0).toFixed(0)}%</Text>
                     </View>
                   )}
-                  {/* Extractor */}
                   <View style={[styles.statusChip, { borderColor: data.extractor === 'ON' ? C.teal + '60' : C.border }]}>
                     <View style={[styles.statusDot, { backgroundColor: data.extractor === 'ON' ? C.teal : C.textMuted }]} />
                     <Text style={[styles.statusText, { color: data.extractor === 'ON' ? C.teal : C.textMuted }]}>
                       Extractor {data.extractor}
                     </Text>
                   </View>
-                  {/* Gas activador */}
                   {data.gas_activador && data.gas_activador !== 'Ninguno' && (
                     <View style={[styles.statusChip, { borderColor: C.amber + '50' }]}>
                       <Text style={[styles.statusText, { color: C.amber }]}>⚠ {data.gas_activador}</Text>
                     </View>
                   )}
-                  {data.metodo && (
-                    <Text style={styles.metodoText}>{data.metodo}</Text>
-                  )}
+                  {data.metodo && <Text style={styles.metodoText}>{data.metodo}</Text>}
                 </View>
               </View>
 
-              {/* Gases principales */}
               <View style={styles.gasSeparator} />
               {(data.pm25_ugm3 ?? 0) > 0 && (
-                <GasBar label="PM2.5 (Part.)" value={data.pm25_ugm3 ?? 0}  max={250}  color={C.pm25}  unit="μg/m³" alert={(data.pm25_ugm3 ?? 0) > 55}  />
+                <GasBar label="PM2.5 (Part.)" value={data.pm25_ugm3 ?? 0} max={250} color={C.pm25} unit="μg/m³" alert={(data.pm25_ugm3 ?? 0) > 55} />
               )}
-              <GasBar label="CO₂ (Dióxido)"  value={data.co2_ppm ?? 0}    max={5000} color={C.co2}   unit="ppm" alert={(data.co2_ppm ?? 0) > 1000} />
-              <GasBar label="CO (Monóxido)"   value={data.co_ppm ?? 0}     max={100}  color={C.co}    unit="ppm" alert={(data.co_ppm  ?? 0) > 8.7}  />
-              <GasBar label="NH₃ (Amoniaco)"  value={data.nh3_ppm ?? 0}    max={100}  color={C.nh3}   unit="ppm" alert={(data.nh3_ppm ?? 0) > 25}   />
+              <GasBar label="CO₂ (Dióxido)"  value={data.co2_ppm ?? 0} max={5000} color={C.co2} unit="ppm" alert={(data.co2_ppm ?? 0) > 1000} />
+              <GasBar label="CO (Monóxido)"   value={data.co_ppm  ?? 0} max={100}  color={C.co}  unit="ppm" alert={(data.co_ppm  ?? 0) > 8.7}  />
+              <GasBar label="NH₃ (Amoniaco)"  value={data.nh3_ppm ?? 0} max={100}  color={C.nh3} unit="ppm" alert={(data.nh3_ppm ?? 0) > 25}   />
               {(data.cov_ppm ?? 0) > 0 && (
-                <GasBar label="COV (Volát.)"  value={data.cov_ppm ?? 0}    max={10}   color={C.cov}   unit="ppm" alert={(data.cov_ppm ?? 0) > 1}    />
+                <GasBar label="COV (Volát.)" value={data.cov_ppm ?? 0} max={10} color={C.cov} unit="ppm" alert={(data.cov_ppm ?? 0) > 1} />
               )}
               {(data.humo_ppm ?? 0) > 0 && (
-                <GasBar label="Humo"          value={data.humo_ppm ?? 0}   max={200}  color="#94a3b8" unit="ppm" alert={(data.humo_ppm ?? 0) > 50}  />
+                <GasBar label="Humo" value={data.humo_ppm ?? 0} max={200} color="#94a3b8" unit="ppm" alert={(data.humo_ppm ?? 0) > 50} />
               )}
             </View>
 
-            {/* ── Estación más cercana ── */}
-            <TouchableOpacity style={styles.nearestBtn} onPress={handleFindNearest} disabled={searching}>
-              <Text style={styles.nearestBtnText}>{searching ? '🔍 Buscando...' : '📍 Estación más cercana'}</Text>
-            </TouchableOpacity>
+            {/* Estación más cercana */}
+            {dispositivos.some(d => d.latitud && d.longitud) && (
+              <TouchableOpacity style={styles.nearestBtn} onPress={handleFindNearest} disabled={searching}>
+                <Text style={styles.nearestBtnText}>{searching ? '🔍 Buscando...' : '📍 Purificador más cercano'}</Text>
+              </TouchableOpacity>
+            )}
 
             {nearest && (
               <View style={styles.nearestCard}>
@@ -282,8 +332,8 @@ export default function InicioScreen() {
               </View>
             )}
 
-            {/* ── OpenAQ Referencia oficial ── */}
-            {ciudad === 'cochabamba' && (openaq.length > 0 || loadingOAQ) && (
+            {/* OpenAQ Referencia */}
+            {(openaq.length > 0 || loadingOAQ) && (
               <View style={styles.oaqCard}>
                 <View style={styles.oaqHeader}>
                   <Text style={styles.oaqTitle}>🌐 OpenAQ — Estación Oficial</Text>
@@ -305,7 +355,7 @@ export default function InicioScreen() {
               </View>
             )}
 
-            {/* ── Gráfica de tendencia ── */}
+            {/* Gráfica de tendencia */}
             <View style={styles.sectionHeader}>
               <Text style={styles.sectionTitle}>Tendencia</Text>
               {data.timestamp ? <Text style={styles.sectionSub}>{data.timestamp.split(' ')[1]}</Text> : null}
@@ -319,62 +369,66 @@ export default function InicioScreen() {
 }
 
 const styles = StyleSheet.create({
-  screen:       { flex: 1, backgroundColor: C.bg },
-  scroll:       { padding: 16, paddingBottom: 32 },
-  // Ciudad
-  cityRow:      { flexDirection: 'row', gap: 8, marginBottom: 16 },
-  cityBtn:      { flex: 1, paddingVertical: 9, borderRadius: R.sm, alignItems: 'center', backgroundColor: C.bgCard, borderWidth: 1, borderColor: C.border },
-  cityLabel:    { fontSize: 12, fontWeight: '700', color: C.textMuted, letterSpacing: 0.3 },
+  screen:        { flex: 1, backgroundColor: C.bg },
+  scroll:        { padding: 16, paddingBottom: 32 },
+  // Sin dispositivos
+  noDevCard:     { backgroundColor: C.bgCard, borderRadius: R.lg, padding: 24, alignItems: 'center', marginBottom: 16, borderWidth: 1, borderColor: C.border },
+  noDevText:     { color: C.textPrimary, fontSize: 14, fontWeight: '700', marginBottom: 6 },
+  noDevSub:      { color: C.textMuted, fontSize: 12 },
+  // Selector dispositivo
+  devBtn:        { paddingHorizontal: 14, paddingVertical: 10, borderRadius: R.sm, backgroundColor: C.bgCard, borderWidth: 1, borderColor: C.border, marginRight: 8, alignItems: 'center' },
+  devBtnLabel:   { fontSize: 12, fontWeight: '800', color: C.textMuted },
+  devBtnCiudad:  { fontSize: 10, color: C.textMuted, marginTop: 2 },
   // Loading
-  loadingCard:  { backgroundColor: C.bgCard, borderRadius: R.lg, padding: 40, alignItems: 'center', marginBottom: 16, borderWidth: 1, borderColor: C.border },
-  loadingText:  { color: C.textMuted, fontSize: 14, marginTop: 12 },
+  loadingCard:   { backgroundColor: C.bgCard, borderRadius: R.lg, padding: 40, alignItems: 'center', marginBottom: 16, borderWidth: 1, borderColor: C.border },
+  loadingText:   { color: C.textMuted, fontSize: 14, marginTop: 12 },
   // Main card
-  mainCard:     { backgroundColor: C.bgCard, borderRadius: R.xl, borderWidth: 1, borderColor: C.border, padding: 20, marginBottom: 12, elevation: 4 },
-  mainCardInner:{ flexDirection: 'row', alignItems: 'center', marginBottom: 8, gap: 16 },
+  mainCard:      { backgroundColor: C.bgCard, borderRadius: R.xl, borderWidth: 1, borderColor: C.border, padding: 20, marginBottom: 12, elevation: 4 },
+  mainCardInner: { flexDirection: 'row', alignItems: 'center', marginBottom: 8, gap: 16 },
   // AQI Ring
-  aqiRing:      { width: 120, height: 120, borderRadius: 60, borderWidth: 2, alignItems: 'center', justifyContent: 'center' },
-  aqiInner:     { width: 106, height: 106, borderRadius: 53, alignItems: 'center', justifyContent: 'center' },
-  aqiEmoji:     { fontSize: 26, marginBottom: 2 },
-  aqiText:      { fontSize: 13, fontWeight: '900', letterSpacing: -0.3, textAlign: 'center' },
-  aqiSub:       { fontSize: 10, color: C.textMuted, marginTop: 2 },
+  aqiRing:       { width: 120, height: 120, borderRadius: 60, borderWidth: 2, alignItems: 'center', justifyContent: 'center' },
+  aqiInner:      { width: 106, height: 106, borderRadius: 53, alignItems: 'center', justifyContent: 'center' },
+  aqiEmoji:      { fontSize: 26, marginBottom: 2 },
+  aqiText:       { fontSize: 13, fontWeight: '900', letterSpacing: -0.3, textAlign: 'center' },
+  aqiSub:        { fontSize: 10, color: C.textMuted, marginTop: 2 },
   // Info lateral
-  mainInfo:     { flex: 1, gap: 8 },
-  iaBadge:      { backgroundColor: C.bgElevated, borderRadius: 10, padding: 8, borderWidth: 1, borderColor: C.border },
-  iaBadgeText:  { color: C.textMuted, fontSize: 10, fontWeight: '700' },
-  iaConf:       { fontSize: 20, fontWeight: '900', marginTop: 2 },
-  statusChip:   { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 10, borderWidth: 1, backgroundColor: C.bgElevated },
-  statusDot:    { width: 7, height: 7, borderRadius: 3.5 },
-  statusText:   { fontSize: 11, fontWeight: '700' },
-  metodoText:   { fontSize: 9, color: C.textMuted, letterSpacing: 0.3 },
+  mainInfo:      { flex: 1, gap: 8 },
+  iaBadge:       { backgroundColor: C.bgElevated, borderRadius: 10, padding: 8, borderWidth: 1, borderColor: C.border },
+  iaBadgeText:   { color: C.textMuted, fontSize: 10, fontWeight: '700' },
+  iaConf:        { fontSize: 20, fontWeight: '900', marginTop: 2 },
+  statusChip:    { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 10, borderWidth: 1, backgroundColor: C.bgElevated },
+  statusDot:     { width: 7, height: 7, borderRadius: 3.5 },
+  statusText:    { fontSize: 11, fontWeight: '700' },
+  metodoText:    { fontSize: 9, color: C.textMuted, letterSpacing: 0.3 },
   // Gases
-  gasSeparator: { height: 1, backgroundColor: C.border, marginVertical: 14 },
-  gasRow:       { marginBottom: 12 },
-  gasTop:       { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 },
-  gasLabel:     { fontSize: 12, color: C.textSecondary, fontWeight: '600' },
-  gasValue:     { fontSize: 13, fontWeight: '800' },
-  gasUnit:      { fontSize: 10, fontWeight: '400', color: C.textMuted },
-  gasTrack:     { height: 5, backgroundColor: C.bgElevated, borderRadius: 3, overflow: 'hidden' },
-  gasFill:      { height: 5, borderRadius: 3 },
+  gasSeparator:  { height: 1, backgroundColor: C.border, marginVertical: 14 },
+  gasRow:        { marginBottom: 12 },
+  gasTop:        { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 },
+  gasLabel:      { fontSize: 12, color: C.textSecondary, fontWeight: '600' },
+  gasValue:      { fontSize: 13, fontWeight: '800' },
+  gasUnit:       { fontSize: 10, fontWeight: '400', color: C.textMuted },
+  gasTrack:      { height: 5, backgroundColor: C.bgElevated, borderRadius: 3, overflow: 'hidden' },
+  gasFill:       { height: 5, borderRadius: 3 },
   // Nearest
-  nearestBtn:   { backgroundColor: C.tealDim, borderRadius: R.md, paddingVertical: 14, alignItems: 'center', marginBottom: 10, borderWidth: 1, borderColor: C.tealBorder },
+  nearestBtn:    { backgroundColor: C.tealDim, borderRadius: R.md, paddingVertical: 14, alignItems: 'center', marginBottom: 10, borderWidth: 1, borderColor: C.tealBorder },
   nearestBtnText:{ color: C.teal, fontWeight: '800', fontSize: 14 },
-  nearestCard:  { backgroundColor: C.bgCard, borderRadius: R.md, borderWidth: 1, borderColor: C.tealBorder, flexDirection: 'row', alignItems: 'center', padding: 14, marginBottom: 16, gap: 12 },
-  nearestName:  { fontSize: 13, fontWeight: '800', color: C.textPrimary },
-  nearestDist:  { fontSize: 12, color: C.teal, marginTop: 2, fontWeight: '600' },
-  goBtn:        { backgroundColor: C.teal, borderRadius: 10, paddingHorizontal: 14, paddingVertical: 8 },
-  goBtnText:    { color: C.bg, fontWeight: '900', fontSize: 13 },
+  nearestCard:   { backgroundColor: C.bgCard, borderRadius: R.md, borderWidth: 1, borderColor: C.tealBorder, flexDirection: 'row', alignItems: 'center', padding: 14, marginBottom: 16, gap: 12 },
+  nearestName:   { fontSize: 13, fontWeight: '800', color: C.textPrimary },
+  nearestDist:   { fontSize: 12, color: C.teal, marginTop: 2, fontWeight: '600' },
+  goBtn:         { backgroundColor: C.teal, borderRadius: 10, paddingHorizontal: 14, paddingVertical: 8 },
+  goBtnText:     { color: C.bg, fontWeight: '900', fontSize: 13 },
   // Section
-  sectionHeader:{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },
-  sectionTitle: { fontSize: 14, fontWeight: '800', color: C.textSecondary, letterSpacing: 0.5, textTransform: 'uppercase' },
-  sectionSub:   { fontSize: 12, color: C.textMuted },
+  sectionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },
+  sectionTitle:  { fontSize: 14, fontWeight: '800', color: C.textSecondary, letterSpacing: 0.5, textTransform: 'uppercase' },
+  sectionSub:    { fontSize: 12, color: C.textMuted },
   // OpenAQ
-  oaqCard:      { backgroundColor: C.bgCard, borderRadius: R.lg, borderWidth: 1, borderColor: C.tealBorder, padding: 14, marginBottom: 12 },
-  oaqHeader:    { marginBottom: 10 },
-  oaqTitle:     { fontSize: 12, fontWeight: '800', color: C.teal, letterSpacing: 0.3 },
-  oaqSub:       { fontSize: 10, color: C.textMuted, marginTop: 2 },
-  oaqRow:       { flexDirection: 'row', gap: 8 },
-  oaqItem:      { flex: 1, backgroundColor: C.bgElevated, borderRadius: R.sm, padding: 10, alignItems: 'center' },
-  oaqParam:     { fontSize: 9, fontWeight: '800', color: C.textMuted, letterSpacing: 1, marginBottom: 4 },
-  oaqValue:     { fontSize: 16, fontWeight: '900', color: C.textPrimary },
-  oaqUnit:      { fontSize: 9, color: C.textMuted, marginTop: 2 },
+  oaqCard:       { backgroundColor: C.bgCard, borderRadius: R.lg, borderWidth: 1, borderColor: C.tealBorder, padding: 14, marginBottom: 12 },
+  oaqHeader:     { marginBottom: 10 },
+  oaqTitle:      { fontSize: 12, fontWeight: '800', color: C.teal, letterSpacing: 0.3 },
+  oaqSub:        { fontSize: 10, color: C.textMuted, marginTop: 2 },
+  oaqRow:        { flexDirection: 'row', gap: 8 },
+  oaqItem:       { flex: 1, backgroundColor: C.bgElevated, borderRadius: R.sm, padding: 10, alignItems: 'center' },
+  oaqParam:      { fontSize: 9, fontWeight: '800', color: C.textMuted, letterSpacing: 1, marginBottom: 4 },
+  oaqValue:      { fontSize: 16, fontWeight: '900', color: C.textPrimary },
+  oaqUnit:       { fontSize: 9, color: C.textMuted, marginTop: 2 },
 });

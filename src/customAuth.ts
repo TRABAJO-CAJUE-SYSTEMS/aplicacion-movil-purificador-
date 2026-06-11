@@ -16,17 +16,20 @@ export const auth = {
   currentUser: null as CurrentUser | null,
 };
 
-function mapError(code: string): string {
+function mapError(msg: string): string {
   const map: Record<string, string> = {
-    'EMAIL_NOT_FOUND':           'auth/user-not-found',
-    'INVALID_PASSWORD':          'auth/wrong-password',
-    'EMAIL_EXISTS':              'auth/email-already-in-use',
-    'WEAK_PASSWORD':             'auth/weak-password',
-    'INVALID_EMAIL':             'auth/invalid-email',
-    'USER_DISABLED':             'auth/user-disabled',
+    'EMAIL_NOT_FOUND':             'auth/user-not-found',
+    'INVALID_PASSWORD':            'auth/wrong-password',
+    'EMAIL_EXISTS':                'auth/email-already-in-use',
+    'WEAK_PASSWORD':               'auth/weak-password',
+    'INVALID_EMAIL':               'auth/invalid-email',
+    'USER_DISABLED':               'auth/user-disabled',
     'TOO_MANY_ATTEMPTS_TRY_LATER': 'auth/too-many-requests',
+    'INVALID_LOGIN_CREDENTIALS':   'auth/invalid-credentials',
   };
-  return map[code] ?? code;
+  // Firebase puede retornar "CÓDIGO : descripción"
+  const key = msg.split(' : ')[0].trim();
+  return map[key] ?? msg;
 }
 
 async function firebasePost(endpoint: string, body: object) {
@@ -87,7 +90,6 @@ export async function signInWithEmailAndPassword(
     email, password, returnSecureToken: true,
   });
 
-  // Verificar que el correo esté confirmado
   const verified = await isEmailVerified(data.idToken);
   if (!verified) {
     // Guardar idToken temporalmente para poder reenviar verificación
@@ -106,8 +108,12 @@ export async function createUserWithEmailAndPassword(
     email, password, returnSecureToken: true,
   });
 
-  // Enviar correo de verificación automáticamente
-  try { await sendEmailVerification(data.idToken); } catch {}
+  try {
+    await sendEmailVerification(data.idToken);
+  } catch (e: any) {
+    console.warn('Error al enviar correo de verificación:', e);
+    throw { code: 'auth/verification-email-failed', message: e?.message ?? 'No se pudo enviar el correo de verificación' };
+  }
 
   // No iniciar sesión hasta que verifique el correo
   auth.currentUser = null;

@@ -4,7 +4,30 @@
       "Bash(Get-ChildItem -Path \"D:\\\\PROYECTO DE APP NATIVE NO TOCAR\\\\app movil\\\\airpure-app\" -Recurse -Depth 3)",
       "Bash(Select-Object FullName)",
       "Bash(not exist *)",
-      "Bash(npx expo *)"
+      "Bash(npx expo *)",
+      "Bash(Get-ChildItem -Recurse -Force)",
+      "Bash(ls -la \"D:/\" | head -20)",
+      "Bash(keytool -keystore \"C:\\\\Users\\\\cuent\\\\.android\\\\debug.keystore\" -list -v -alias androiddebugkey -storepass android -keypass android)",
+      "Bash(findstr \"SHA1\")",
+      "Bash(keytool -genkey -v -keystore \"C:\\\\Users\\\\cuent\\\\.android\\\\debug.keystore\" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname \"CN=Android Debug,O=Android,C=US\")",
+      "Read(//c/Users/cuent/AppData/Roaming/Claude/local-agent-mode-sessions/skills-plugin/d6861e75-4a0c-40cb-aec5-a8333d1909d2/7e2cde13-8aa7-4406-8ae9-addb02a2b429/skills/xlsx/**)",
+      "Bash(python -c ' *)",
+      "Bash(npx tsc *)",
+      "Bash(node -e \"const p = require\\('./package.json'\\); console.log\\(JSON.stringify\\({devDeps: p.devDependencies, jest: p.jest}, null, 2\\)\\)\")",
+      "Bash(npx react-native-community/cli check)",
+      "Bash(node -e \"require\\('./src/firebaseConfig'\\)\")",
+      "Bash(adb devices *)",
+      "Bash(adb shell *)",
+      "PowerShell(echo \"ANDROID_HOME: $env:ANDROID_HOME\"; echo \"ANDROID_SDK_ROOT: $env:ANDROID_SDK_ROOT\"; if \\(Test-Path \"$env:LOCALAPPDATA\\\\Android\\\\Sdk\"\\) { echo \"SDK encontrado en: $env:LOCALAPPDATA\\\\Android\\\\Sdk\" } elseif \\(Test-Path \"C:\\\\Android\\\\Sdk\"\\) { echo \"SDK en C:\\\\Android\\\\Sdk\" } else { echo \"SDK no encontrado en rutas comunes\" })",
+      "PowerShell($current = \\(Get-ItemProperty -Path \"HKLM:\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\FileSystem\" -Name \"LongPathsEnabled\" -ErrorAction SilentlyContinue\\).LongPathsEnabled; echo \"LongPathsEnabled actual: $current\")",
+      "PowerShell(cmd /c rmdir D:\\\\ap)",
+      "PowerShell(cmd /c mklink /J D:\\\\ap \"D:\\\\PROYECTO DE APP NATIVE NO TOCAR\\\\app movil\\\\airpure-app\")",
+      "Bash(Copy-Item \"D:\\\\PROYECTO DE APP NATIVE NO TOCAR\\\\app movil\\\\airpure-app\\\\src\\\\hooks\\\\useBleManager.ts\" \"D:\\\\airpure\\\\src\\\\hooks\\\\useBleManager.ts\" -Force)",
+      "Bash(adb -s 098936438L006433 install -r \"D:\\\\airpure\\\\android\\\\app\\\\build\\\\outputs\\\\apk\\\\release\\\\app-release.apk\")",
+      "Bash(Copy-Item \"D:\\\\PROYECTO DE APP NATIVE NO TOCAR\\\\app movil\\\\airpure-app\\\\src\\\\screens\\\\SaludScreen.tsx\" \"D:\\\\airpure\\\\src\\\\screens\\\\SaludScreen.tsx\" -Force)",
+      "Bash(.\\\\gradlew.bat app:assembleRelease -x lint -x test --build-cache)",
+      "Bash(./gradlew assembleRelease --no-daemon)",
+      "PowerShell($apk = \"D:\\\\airpure\\\\android\\\\app\\\\build\\\\outputs\\\\apk\\\\release\\\\app-release.apk\"; \\(Get-Item $apk\\).LastWriteTime; \\(Get-Item $apk\\).Length / 1MB | ForEach-Object { \"{0:N1} MB\" -f $_ })"
     ]
   }
 }

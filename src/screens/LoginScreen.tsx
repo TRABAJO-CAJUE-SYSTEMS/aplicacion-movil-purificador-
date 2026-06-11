@@ -15,8 +15,9 @@ import * as WebBrowser from 'expo-web-browser';
 
 WebBrowser.maybeCompleteAuthSession();
 
-const GOOGLE_WEB_CLIENT_ID = '864375202936-edi9idi7qge9705gj1n83mev0ll6pr6h.apps.googleusercontent.com';
-const GOOGLE_REDIRECT_URI  = 'https://auth.expo.io/@juamky/airpure-app';
+const GOOGLE_WEB_CLIENT_ID     = '864375202936-edi9idi7qge9705gj1n83mev0ll6pr6h.apps.googleusercontent.com';
+const GOOGLE_ANDROID_CLIENT_ID = '864375202936-27nb3br8saegf3u15ajnnmv0fnkqscp2.apps.googleusercontent.com'; // Android OAuth client (Google Cloud Console)
+const GOOGLE_REDIRECT_URI      = 'https://auth.expo.io/@juamky/airpure-app';
 
 export default function LoginScreen() {
   const [isLogin,      setIsLogin]      = useState(true);
@@ -30,8 +31,9 @@ export default function LoginScreen() {
 
   // Google auth request
   const [, response, promptAsync] = Google.useAuthRequest({
-    webClientId:  GOOGLE_WEB_CLIENT_ID,
-    redirectUri:  GOOGLE_REDIRECT_URI,
+    webClientId:     GOOGLE_WEB_CLIENT_ID,
+    androidClientId: GOOGLE_ANDROID_CLIENT_ID,
+    redirectUri:     GOOGLE_REDIRECT_URI,
   });
 
   // Manejar respuesta de Google OAuth
@@ -107,7 +109,9 @@ export default function LoginScreen() {
         'auth/wrong-password':       'Contraseña incorrecta',
         'auth/email-already-in-use': 'Ese correo ya está registrado',
         'auth/weak-password':        'La contraseña debe tener al menos 6 caracteres',
-        'INVALID_LOGIN_CREDENTIALS': 'Correo o contraseña incorrectos',
+        'auth/invalid-credentials':  'Correo o contraseña incorrectos',
+        'auth/too-many-requests':    'Demasiados intentos. Espera unos minutos.',
+        'auth/verification-email-failed': 'Cuenta creada pero no se pudo enviar el correo. Intenta iniciar sesión para reenviar.',
       };
       Alert.alert('Error', msgs[e.code] ?? e.message ?? 'Error de autenticación');
     } finally { setLoading(false); }

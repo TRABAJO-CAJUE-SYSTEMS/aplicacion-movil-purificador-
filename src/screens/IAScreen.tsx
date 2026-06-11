@@ -5,9 +5,10 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Header from '../components/Header';
-import { database, ref, onValue, set } from '../firebaseConfig';
+import { database, ref, onValue, set, auth } from '../firebaseConfig';
 
 interface DispositivoState {
+  nombre?:       string;
   calidad_aire:  string;
   confianza_ia:  number;
   co2_ppm:       number;
@@ -17,10 +18,8 @@ interface DispositivoState {
   gas_critico:   string;
   ultima_actualizacion: string;
 }
-
-interface LogEvento {
-  id: string; hora: string; calidad: string; mensaje: string;
-}
+interface DispositivoInfo { id: string; nombre: string; }
+interface LogEvento { id: string; hora: string; calidad: string; mensaje: string; }
 
 function colorCalidad(c: string): string {
   const v = (c ?? '').toLowerCase();
@@ -43,17 +42,39 @@ function BarraConfianza({ valor, color }: { valor: number; color: string }) {
   );
 }
 
-const CIUDAD = 'cochabamba';
-
 const IAScreen: React.FC = () => {
-  const [data,    setData]    = useState<DispositivoState | null>(null);
-  const [online,  setOnline]  = useState(false);
-  const [logs,    setLogs]    = useState<LogEvento[]>([]);
+  const uid = auth.currentUser?.uid ?? '';
+
+  const [dispositivos,   setDispositivos]   = useState<DispositivoInfo[]>([]);
+  const [dispositivoSel, setDispositivoSel] = useState<string>('');
+  const [data,           setData]           = useState<DispositivoState | null>(null);
+  const [online,         setOnline]         = useState(false);
+  const [logs,           setLogs]           = useState<LogEvento[]>([]);
   const prevCalidadRef = useRef<string>('');
   const lastTimeRef    = useRef<number>(0);
 
+  // Cargar lista de dispositivos del usuario
   useEffect(() => {
-    const unsub = onValue(ref(database, `dispositivos/${CIUDAD}`), (snap) => {
+    if (!uid) return;
+    const unsub = onValue(ref(database, `dispositivos/${uid}`), (snap) => {
+      if (snap.exists()) {
+        const lista: DispositivoInfo[] = Object.entries(snap.val() as Record<string, any>)
+          .map(([id, d]) => ({ id, nombre: d.nombre || id }));
+        setDispositivos(lista);
+        if (!dispositivoSel && lista.length > 0) {
+          setDispositivoSel(lista[0].id);
+        }
+      } else {
+        setDispositivos([]);
+      }
+    });
+    return () => unsub();
+  }, [uid]);
+
+  // Escuchar datos del dispositivo seleccionado
+  useEffect(() => {
+    if (!uid || !dispositivoSel) return;
+    const unsub = onValue(ref(database, `dispositivos/${uid}/${dispositivoSel}`), (snap) => {
       if (snap.exists()) {
         const d = snap.val() as DispositivoState;
         setData(d);
@@ -61,21 +82,20 @@ const IAScreen: React.FC = () => {
         lastTimeRef.current = Date.now();
       }
     });
-    // Detectar desconexión
     const iv = setInterval(() => {
       if (lastTimeRef.current && (Date.now() - lastTimeRef.current) / 1000 > 30) {
         setOnline(false);
       }
     }, 5000);
     return () => { unsub(); clearInterval(iv); };
-  }, []);
+  }, [uid, dispositivoSel]);
 
-  // Logs de cambios
+  // Logs de cambios de clasificación
   useEffect(() => {
     const calidad = data?.calidad_aire ?? '';
     if (calidad && calidad !== prevCalidadRef.current) {
       const ahora = new Date();
-      setLogs((prev) => [{
+      setLogs(prev => [{
         id:      Math.random().toString(36).slice(2, 9),
         hora:    `${ahora.getHours().toString().padStart(2,'0')}:${ahora.getMinutes().toString().padStart(2,'0')}:${ahora.getSeconds().toString().padStart(2,'0')}`,
         calidad,
@@ -85,9 +105,11 @@ const IAScreen: React.FC = () => {
     }
   }, [data?.calidad_aire]);
 
+  // Restaurar control a la IA → escribe en control/{uid}/{deviceId}/
   const devolverControlIA = async () => {
+    if (!uid || !dispositivoSel) return;
     try {
-      await set(ref(database, `control/${CIUDAD}/modo_automatico`), true);
+      await set(ref(database, `control/${uid}/${dispositivoSel}/modo_automatico`), true);
     } catch (e) { console.error(e); }
   };
 
@@ -99,12 +121,32 @@ const IAScreen: React.FC = () => {
     return 'Analizando ambiente con Edge Impulse v4...';
   };
 
-  const aqiColor = colorCalidad(data?.calidad_aire ?? '');
+  const aqiColorVal = colorCalidad(data?.calidad_aire ?? '');
 
   return (
     <SafeAreaView style={styles.safeArea}>
       <Header title="Monitor IA" />
       <ScrollView contentContainerStyle={styles.container}>
+
+        {/* Selector de dispositivo (si hay más de 1) */}
+        {dispositivos.length > 1 && (
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 12 }}>
+            {dispositivos.map(d => (
+              <TouchableOpacity key={d.id}
+                style={[styles.devChip, dispositivoSel === d.id && styles.devChipActive]}
+                onPress={() => { setDispositivoSel(d.id); setData(null); setOnline(false); prevCalidadRef.current = ''; }}>
+                <Text style={[styles.devChipText, dispositivoSel === d.id && { color: '#007F7A' }]}>{d.nombre}</Text>
+              </TouchableOpacity>
+            ))}
+          </ScrollView>
+        )}
+
+        {dispositivos.length === 0 && (
+          <View style={styles.emptyCard}>
+            <Text style={styles.emptyText}>📡 Sin purificadores registrados</Text>
+            <Text style={styles.emptyDesc}>Ve a Dispositivos → Agregar purificador</Text>
+          </View>
+        )}
 
         {/* Estado conexión */}
         <View style={[styles.connectionBadge, { backgroundColor: online ? '#00AFAA15' : '#F4433615', borderColor: online ? '#00AFAA40' : '#F4433640' }]}>
@@ -115,16 +157,16 @@ const IAScreen: React.FC = () => {
         </View>
 
         {/* Predicción principal */}
-        <View style={[styles.card, { borderColor: aqiColor + '40' }]}>
+        <View style={[styles.card, { borderColor: aqiColorVal + '40' }]}>
           <Text style={styles.cardLabel}>CLASIFICACIÓN DEL MODELO</Text>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 14, marginBottom: 20 }}>
-            <View style={[styles.aqiIcon, { backgroundColor: aqiColor + '15', borderColor: aqiColor + '50' }]}>
+            <View style={[styles.aqiIcon, { backgroundColor: aqiColorVal + '15', borderColor: aqiColorVal + '50' }]}>
               <Text style={{ fontSize: 28 }}>
                 {(data?.calidad_aire ?? '').toLowerCase() === 'bueno' ? '✓' : '⚠'}
               </Text>
             </View>
             <View style={{ flex: 1 }}>
-              <Text style={[styles.aqiValue, { color: aqiColor }]}>
+              <Text style={[styles.aqiValue, { color: aqiColorVal }]}>
                 {data?.calidad_aire
                   ? data.calidad_aire.charAt(0).toUpperCase() + data.calidad_aire.slice(1).toLowerCase()
                   : 'Esperando...'}
@@ -137,7 +179,7 @@ const IAScreen: React.FC = () => {
               <Text style={styles.confLabel}>Certeza de la predicción</Text>
               <Text style={styles.confValue}>{(data?.confianza_ia ?? 0).toFixed(1)}%</Text>
             </View>
-            <BarraConfianza valor={data?.confianza_ia ?? 0} color={aqiColor} />
+            <BarraConfianza valor={data?.confianza_ia ?? 0} color={aqiColorVal} />
           </View>
         </View>
 
@@ -145,7 +187,7 @@ const IAScreen: React.FC = () => {
         <View style={styles.row3}>
           {[
             { emoji: data?.extractor === 'ON' ? '🔄' : '⏸️', label: 'Extractor', value: data?.extractor ?? '—', color: data?.extractor === 'ON' ? '#00AFAA' : '#999' },
-            { emoji: '🧠', label: 'Modelo', value: 'EI v4',  color: '#818cf8' },
+            { emoji: '🧠', label: 'Modelo', value: 'EI v4',   color: '#818cf8' },
             { emoji: '⚡', label: 'Inferencia', value: '~45ms', color: '#FF9800' },
           ].map(({ emoji, label, value, color }) => (
             <View key={label} style={styles.miniCard}>
@@ -206,9 +248,11 @@ const IAScreen: React.FC = () => {
         </View>
 
         {/* Botón restaurar IA */}
-        <TouchableOpacity style={styles.restoreBtn} onPress={devolverControlIA}>
-          <Text style={styles.restoreBtnText}>🤖  Restaurar control a la IA</Text>
-        </TouchableOpacity>
+        {dispositivoSel !== '' && (
+          <TouchableOpacity style={styles.restoreBtn} onPress={devolverControlIA}>
+            <Text style={styles.restoreBtnText}>🤖  Restaurar control a la IA</Text>
+          </TouchableOpacity>
+        )}
 
       </ScrollView>
     </SafeAreaView>
@@ -218,33 +262,42 @@ const IAScreen: React.FC = () => {
 export default IAScreen;
 
 const styles = StyleSheet.create({
-  safeArea:       { flex: 1, backgroundColor: '#f5f5f5' },
-  container:      { padding: 16, paddingBottom: 40 },
-  connectionBadge:{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 20, borderWidth: 1, marginBottom: 16, alignSelf: 'flex-start' },
-  dot:            { width: 8, height: 8, borderRadius: 4 },
-  connectionText: { fontSize: 12, fontWeight: '700' },
-  card:           { backgroundColor: '#fff', borderRadius: 16, padding: 20, marginBottom: 14, elevation: 2, borderWidth: 1, borderColor: '#eee' },
-  cardLabel:      { fontSize: 10, fontWeight: '800', letterSpacing: 2, color: '#999', textTransform: 'uppercase', marginBottom: 14 },
-  aqiIcon:        { width: 60, height: 60, borderRadius: 18, alignItems: 'center', justifyContent: 'center', borderWidth: 1.5 },
-  aqiValue:       { fontSize: 26, fontWeight: '900', letterSpacing: -0.5 },
-  gasCritico:     { fontSize: 12, color: '#666', marginTop: 3 },
-  confLabel:      { fontSize: 12, color: '#666' },
-  confValue:      { fontSize: 13, fontWeight: '800', color: '#333' },
-  row3:           { flexDirection: 'row', gap: 10, marginBottom: 14 },
-  miniCard:       { flex: 1, backgroundColor: '#fff', borderRadius: 14, padding: 14, alignItems: 'center', elevation: 2 },
-  miniLabel:      { fontSize: 9, fontWeight: '700', color: '#999', letterSpacing: 1.5, textTransform: 'uppercase', marginBottom: 4 },
-  miniValue:      { fontSize: 13, fontWeight: '900' },
-  sensLabel:      { fontSize: 13, color: '#444' },
-  sensValue:      { fontSize: 13, fontWeight: '700', color: '#333' },
-  insightCard:    { backgroundColor: '#1a1a2e', borderRadius: 16, padding: 18, marginBottom: 14 },
-  insightHeader:  { fontSize: 13, fontWeight: '700', color: '#818cf8', marginBottom: 10 },
-  insightText:    { fontSize: 13, color: '#c5c5e8', lineHeight: 20 },
-  console:        { backgroundColor: '#111', borderRadius: 16, overflow: 'hidden', marginBottom: 14 },
-  consoleHeader:  { backgroundColor: '#222', paddingHorizontal: 14, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#333' },
-  consoleTitle:   { fontSize: 11, fontWeight: '700', color: '#888', fontFamily: 'monospace' },
-  consoleIdle:    { fontSize: 11, color: '#555', fontStyle: 'italic', fontFamily: 'monospace' },
-  consoleTime:    { fontSize: 10, color: '#00AFAA', fontFamily: 'monospace', flexShrink: 0 },
-  consoleMsg:     { fontSize: 10, fontFamily: 'monospace', flex: 1 },
-  restoreBtn:     { backgroundColor: '#fff', borderRadius: 16, paddingVertical: 16, alignItems: 'center', elevation: 2, borderWidth: 1, borderColor: '#818cf840' },
-  restoreBtnText: { fontSize: 14, fontWeight: '800', color: '#818cf8' },
+  safeArea:        { flex: 1, backgroundColor: '#f5f5f5' },
+  container:       { padding: 16, paddingBottom: 40 },
+  // Selector dispositivo
+  devChip:         { backgroundColor: '#fff', borderRadius: 12, paddingHorizontal: 14, paddingVertical: 8, marginRight: 8, borderWidth: 1.5, borderColor: '#eee', elevation: 1 },
+  devChipActive:   { backgroundColor: '#00AFAA15', borderColor: '#007F7A' },
+  devChipText:     { fontSize: 13, fontWeight: '700', color: '#666' },
+  // Empty
+  emptyCard:       { backgroundColor: '#fff', borderRadius: 14, padding: 24, alignItems: 'center', marginBottom: 12, elevation: 1 },
+  emptyText:       { fontSize: 14, fontWeight: '700', color: '#555', marginBottom: 6 },
+  emptyDesc:       { fontSize: 12, color: '#aaa' },
+  // Conexión
+  connectionBadge: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 20, borderWidth: 1, marginBottom: 16, alignSelf: 'flex-start' },
+  dot:             { width: 8, height: 8, borderRadius: 4 },
+  connectionText:  { fontSize: 12, fontWeight: '700' },
+  card:            { backgroundColor: '#fff', borderRadius: 16, padding: 20, marginBottom: 14, elevation: 2, borderWidth: 1, borderColor: '#eee' },
+  cardLabel:       { fontSize: 10, fontWeight: '800', letterSpacing: 2, color: '#999', textTransform: 'uppercase', marginBottom: 14 },
+  aqiIcon:         { width: 60, height: 60, borderRadius: 18, alignItems: 'center', justifyContent: 'center', borderWidth: 1.5 },
+  aqiValue:        { fontSize: 26, fontWeight: '900', letterSpacing: -0.5 },
+  gasCritico:      { fontSize: 12, color: '#666', marginTop: 3 },
+  confLabel:       { fontSize: 12, color: '#666' },
+  confValue:       { fontSize: 13, fontWeight: '800', color: '#333' },
+  row3:            { flexDirection: 'row', gap: 10, marginBottom: 14 },
+  miniCard:        { flex: 1, backgroundColor: '#fff', borderRadius: 14, padding: 14, alignItems: 'center', elevation: 2 },
+  miniLabel:       { fontSize: 9, fontWeight: '700', color: '#999', letterSpacing: 1.5, textTransform: 'uppercase', marginBottom: 4 },
+  miniValue:       { fontSize: 13, fontWeight: '900' },
+  sensLabel:       { fontSize: 13, color: '#444' },
+  sensValue:       { fontSize: 13, fontWeight: '700', color: '#333' },
+  insightCard:     { backgroundColor: '#1a1a2e', borderRadius: 16, padding: 18, marginBottom: 14 },
+  insightHeader:   { fontSize: 13, fontWeight: '700', color: '#818cf8', marginBottom: 10 },
+  insightText:     { fontSize: 13, color: '#c5c5e8', lineHeight: 20 },
+  console:         { backgroundColor: '#111', borderRadius: 16, overflow: 'hidden', marginBottom: 14 },
+  consoleHeader:   { backgroundColor: '#222', paddingHorizontal: 14, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#333' },
+  consoleTitle:    { fontSize: 11, fontWeight: '700', color: '#888', fontFamily: 'monospace' },
+  consoleIdle:     { fontSize: 11, color: '#555', fontStyle: 'italic', fontFamily: 'monospace' },
+  consoleTime:     { fontSize: 10, color: '#00AFAA', fontFamily: 'monospace', flexShrink: 0 },
+  consoleMsg:      { fontSize: 10, fontFamily: 'monospace', flex: 1 },
+  restoreBtn:      { backgroundColor: '#fff', borderRadius: 16, paddingVertical: 16, alignItems: 'center', elevation: 2, borderWidth: 1, borderColor: '#818cf840' },
+  restoreBtnText:  { fontSize: 14, fontWeight: '800', color: '#818cf8' },
 });

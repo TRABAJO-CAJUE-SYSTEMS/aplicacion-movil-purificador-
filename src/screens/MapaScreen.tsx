@@ -6,7 +6,7 @@ import {
 import MapView, { Marker, Callout, Circle } from 'react-native-maps';
 import * as Location from 'expo-location';
 import Header from '../components/Header';
-import { database, ref, onValue } from '../firebaseConfig';
+import { database, ref, onValue, auth } from '../firebaseConfig';
 import { aqiColor, AQI_LEVELS } from '../theme';
 
 interface EstacionData {
@@ -59,45 +59,32 @@ const MapaScreen: React.FC = () => {
   const [searching,   setSearching]   = useState(false);
   const mapRef = useRef<MapView>(null);
 
-  // Cargar estaciones desde Firebase (/dispositivos/*)
+  // Cargar dispositivos del usuario desde dispositivos/{uid}/
   useEffect(() => {
-    const CIUDADES = ['cochabamba', 'la_paz', 'santa_cruz'];
-    const results: (Candidato & { id: string; data?: EstacionData })[] = [];
-    let loaded = 0;
+    const uid = auth.currentUser?.uid ?? '';
+    if (!uid) { setLoading(false); return; }
 
-    CIUDADES.forEach((id) => {
-      onValue(ref(database, `dispositivos/${id}`), (snap) => {
-        loaded++;
-        if (snap.exists()) {
-          const d = snap.val();
+    const unsub = onValue(ref(database, `dispositivos/${uid}`), (snap) => {
+      if (snap.exists()) {
+        const results: (Candidato & { id: string; data?: EstacionData })[] = [];
+        Object.entries(snap.val() as Record<string, any>).forEach(([id, d]) => {
           results.push({
-            id, nombre: d.ciudad ?? id,
-            lat: d.latitud ?? ESTACIONES_BASE.find(e => e.nombre.toLowerCase().includes(id.split('_')[0]))?.lat ?? -17.3935,
-            lon: d.longitud ?? ESTACIONES_BASE.find(e => e.nombre.toLowerCase().includes(id.split('_')[0]))?.lon ?? -66.1570,
+            id,
+            nombre: d.nombre || id,
+            lat: d.latitud  ?? -17.3935,
+            lon: d.longitud ?? -66.1570,
             data: d,
           });
-        }
-        if (loaded === CIUDADES.length) {
-          setEstaciones(results);
-          setCandidatos(results.length > 0 ? results : ESTACIONES_BASE);
-          setLoading(false);
-        }
-      }, { onlyOnce: true });
-    });
-
-    // También cargar dispositivos_registrados con GPS
-    onValue(ref(database, 'dispositivos_registrados'), (snap) => {
-      if (!snap.exists()) return;
-      const extras: Candidato[] = [];
-      Object.values(snap.val() as Record<string, any>).forEach((d) => {
-        if (d.activo !== false && d.latitud && d.longitud) {
-          extras.push({ nombre: d.nombre, lat: d.latitud, lon: d.longitud });
-        }
-      });
-      if (extras.length > 0) {
-        setCandidatos((prev) => [...prev, ...extras]);
+        });
+        setEstaciones(results);
+        setCandidatos(results);
+      } else {
+        setEstaciones([]);
+        setCandidatos(ESTACIONES_BASE);
       }
-    }, { onlyOnce: true });
+      setLoading(false);
+    });
+    return () => unsub();
   }, []);
 
   const handleFindNearest = async () => {

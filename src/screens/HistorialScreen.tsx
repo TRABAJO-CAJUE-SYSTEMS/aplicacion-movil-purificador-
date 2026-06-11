@@ -7,6 +7,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { LineChart } from 'react-native-chart-kit';
 import Header from '../components/Header';
 import { database, ref, query, orderByKey, limitToLast, onValue, auth } from '../firebaseConfig';
+// Nota: "Mis purificadores" usa data/{uid}/{deviceId}/ y dispositivos/{uid}/
 
 const { width } = Dimensions.get('window');
 
@@ -27,7 +28,8 @@ const GASES: { key: GasKey; label: string; color: string; unit: string }[] = [
   { key: 'pm25_ugm3', label: 'PM2.5', color: '#F43F5E', unit: 'μg/m³' },
   { key: 'cov_ppm',   label: 'COV',   color: '#06B6D4', unit: 'ppm'   },
 ];
-const LIMITES: Record<Filtro, number> = { '24h': 48, '7d': 200, '30d': 500 };
+// 5 min por registro: 24h=288, 7d=2016, 30d=8640 (+ margen para huecos)
+const LIMITES: Record<Filtro, number> = { '24h': 300, '7d': 2100, '30d': 8700 };
 const SECS:    Record<Filtro, number> = { '24h': 86400, '7d': 604800, '30d': 2592000 };
 
 function colorCalidad(c: string) {
@@ -185,34 +187,30 @@ export default function HistorialScreen() {
     return () => unsub();
   }, [ciudadGeneral, filtro, seccion]);
 
-  // Cargar mis purificadores registrados
+  // Cargar mis purificadores desde dispositivos/{uid}/
   useEffect(() => {
     if (seccion !== 'mis_purificadores') return;
-    const uid = auth.currentUser?.uid;
-    const unsub = onValue(ref(database, 'dispositivos_registrados'), (snap) => {
+    const uid = auth.currentUser?.uid ?? '';
+    if (!uid) { setMisPurificadores([]); return; }
+    const unsub = onValue(ref(database, `dispositivos/${uid}`), (snap) => {
       if (!snap.exists()) { setMisPurificadores([]); return; }
       const todos = Object.entries(snap.val() as Record<string, any>)
-        .filter(([id, d]) => {
-          // Excluir entradas generales (no son purificadores del usuario)
-          const esGeneral = ['cochabamba', 'la_paz', 'santa_cruz', 'oruro', 'potosi', 'sucre'].includes(id);
-          // Solo mostrar dispositivos activos con nombre personalizado
-          const tieneNombre = d.nombre && d.nombre.length > 0;
-          return !esGeneral && d.activo !== false && tieneNombre;
-        })
-        .map(([id, d]) => ({ id, nombre: d.nombre || id, ciudad: d.firebase_path || d.ciudad || '' }));
+        .map(([id, d]) => ({ id, nombre: d.nombre || id, ciudad: d.ciudad || '' }));
       setMisPurificadores(todos);
       if (todos.length > 0 && !purificadorSel) {
-        setPurificadorSel(todos[0].ciudad);
+        setPurificadorSel(todos[0].id);
       }
     });
     return () => unsub();
   }, [seccion]);
 
-  // Cargar historial del purificador seleccionado
+  // Cargar historial del purificador seleccionado desde data/{uid}/{deviceId}/
   useEffect(() => {
     if (seccion !== 'mis_purificadores' || !purificadorSel) return;
+    const uid = auth.currentUser?.uid ?? '';
+    if (!uid) return;
     setLoadingMio(true);
-    const q = query(ref(database, `data/${purificadorSel}`), orderByKey(), limitToLast(LIMITES[filtro]));
+    const q = query(ref(database, `data/${uid}/${purificadorSel}`), orderByKey(), limitToLast(LIMITES[filtro]));
     const unsub = onValue(q, (snap) => {
       if (snap.exists()) {
         const now = Date.now() / 1000;
@@ -295,14 +293,14 @@ export default function HistorialScreen() {
                 <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 14 }}>
                   {misPurificadores.map((p) => (
                     <TouchableOpacity key={p.id}
-                      style={[styles.purChip, purificadorSel === p.ciudad && styles.purChipActive]}
-                      onPress={() => setPurificadorSel(p.ciudad)}>
+                      style={[styles.purChip, purificadorSel === p.id && styles.purChipActive]}
+                      onPress={() => setPurificadorSel(p.id)}>
                       <Text style={styles.purChipIcon}>💨</Text>
                       <View>
-                        <Text style={[styles.purChipName, purificadorSel === p.ciudad && { color: '#007F7A' }]}>
+                        <Text style={[styles.purChipName, purificadorSel === p.id && { color: '#007F7A' }]}>
                           {p.nombre}
                         </Text>
-                        <Text style={styles.purChipCiudad}>{p.ciudad}</Text>
+                        <Text style={styles.purChipCiudad}>{p.ciudad || p.id}</Text>
                       </View>
                     </TouchableOpacity>
                   ))}
@@ -310,7 +308,7 @@ export default function HistorialScreen() {
 
                 {purificadorSel && (
                   <SeccionHistorial
-                    ciudad={misPurificadores.find(p => p.ciudad === purificadorSel)?.nombre ?? purificadorSel}
+                    ciudad={misPurificadores.find(p => p.id === purificadorSel)?.nombre ?? purificadorSel}
                     filtro={filtro} gasKey={gasKey}
                     loading={loadingMio} history={histMio}
                   />
